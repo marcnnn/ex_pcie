@@ -101,7 +101,8 @@ defmodule ExPcie.Model.Core do
     mem_read: nil,
     mem_write: nil,
     bar_aperture: 20,
-    error_reads: []
+    error_reads: [],
+    drop_reads: []
   }
 
   @doc """
@@ -110,7 +111,8 @@ defmodule ExPcie.Model.Core do
   `msix_enable` (true), `msi_enable` (false), `msix_mask`, `cuts`,
   `reorder`, `latency`, `cq_valid`, `rc_valid`, `cc_ready`, `rq_ready`,
   `irq_fail`, `irq_latency`, `on_irq`, `mem_read`, `mem_write`, `bar_aperture`, `error_reads`
-  (host addresses whose reads complete with Unsupported Request), `seed`.
+  (host addresses whose reads complete with Unsupported Request), `drop_reads`
+  (host addresses whose reads never complete, for completion timeouts), `seed`.
   """
   def new(opts \\ []) do
     cfg = Map.merge(@defaults, Map.new(Keyword.delete(opts, :seed)))
@@ -510,47 +512,59 @@ defmodule ExPcie.Model.Core do
     stop = t.address + bytes
 
     {items, c} =
-      if t.address in cfg.error_reads do
-        cpl = %TLP{
-          kind: :cpl,
-          status: TLP.status(:ur),
-          completer_id: cfg.completer_id,
-          requester_id: cfg.requester_id,
-          tag: t.tag,
-          byte_count: 4,
-          length_dw: 0
-        }
+      cond do
+        t.address in cfg.drop_reads ->
+          {[], c}
 
-        {[{ready0, Axis.rc_beats(cpl, t.address, true, error_code: 2), true}], c}
-      else
-        {cuts, c} = pick_cuts(c, t.address, stop)
-        chunks = TLP.completion_chunks(t.address, bytes, cfg.rcb, cfg.mps, cuts)
-        n = length(chunks)
+        t.address in cfg.error_reads ->
+          cpl = %TLP{
+            kind: :cpl,
+            status: TLP.status(:ur),
+            completer_id: cfg.completer_id,
+            requester_id: cfg.requester_id,
+            tag: t.tag,
+            byte_count: 4,
+            length_dw: 0
+          }
 
-        {items, c} =
-          chunks
-          |> Enum.with_index()
-          |> Enum.map_reduce(c, fn {{a, len}, i}, c ->
-            {c, data} = mem_read(c, a, len)
+          {[{ready0, Axis.rc_beats(cpl, t.address, true, error_code: 2), true}], c}
 
-            cpl = %TLP{
-              kind: :cpld,
-              completer_id: cfg.completer_id,
-              requester_id: cfg.requester_id,
-              tag: t.tag,
-              byte_count: stop - a,
-              lower_address: a &&& 0x7F,
-              length_dw: div(len, 4),
-              data: data
-            }
+        true ->
+          {cuts, c} = pick_cuts(c, t.address, stop)
+          chunks = TLP.completion_chunks(t.address, bytes, cfg.rcb, cfg.mps, cuts)
+          n = length(chunks)
 
-            {{ready0 + i, Axis.rc_beats(cpl, a, i == n - 1), i == n - 1}, c}
-          end)
+          {items, c} =
+            chunks
+            |> Enum.with_index()
+            |> Enum.map_reduce(c, fn {{a, len}, i}, c ->
+              {c, data} = mem_read(c, a, len)
 
-        {items, c}
+              cpl = %TLP{
+                kind: :cpld,
+                completer_id: cfg.completer_id,
+                requester_id: cfg.requester_id,
+                tag: t.tag,
+                byte_count: stop - a,
+                lower_address: a &&& 0x7F,
+                length_dw: div(len, 4),
+                data: data
+              }
+
+              {{ready0 + i, Axis.rc_beats(cpl, a, i == n - 1), i == n - 1}, c}
+            end)
+
+          {items, c}
       end
 
-    %{c | rc_reqs: c.rc_reqs ++ [{t.tag, items}]}
+    # a dropped read frees its tag at once: the requester may reuse it after its timeout
+    if items == [],
+      do: %{
+        c
+        | outstanding: Map.delete(c.outstanding, t.tag),
+          stats: Map.update(c.stats, :dropped, 1, &(&1 + 1))
+      },
+      else: %{c | rc_reqs: c.rc_reqs ++ [{t.tag, items}]}
   end
 
   defp pick_cuts(c, start, stop) do

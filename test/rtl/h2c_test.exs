@@ -29,6 +29,7 @@ defmodule ExPcie.RTL.H2cTest do
         rc_valid: Keyword.get(opts, :rc_valid, 0.8),
         rq_ready: Keyword.get(opts, :rq_ready, 0.8),
         error_reads: Keyword.get(opts, :error_reads, []),
+        drop_reads: Keyword.get(opts, :drop_reads, []),
         irq_latency: {1, 2}
       )
       |> Core.put_mem(base, data)
@@ -44,7 +45,7 @@ defmodule ExPcie.RTL.H2cTest do
       })
 
     bench =
-      Bench.new(Tops.h2c(),
+      Bench.new(Tops.h2c(Keyword.take(opts, [:timeout])),
         core: core,
         pins: pins,
         sink: Sink.new(:m_axis, ready: Keyword.get(opts, :ready, 0.7), seed: seed)
@@ -174,6 +175,31 @@ defmodule ExPcie.RTL.H2cTest do
     {bench, _data, _n} = run_case(seed: 4, error_reads: [@base + 256], laps: 2)
     assert Bench.output(bench, :err_count) >= 1
     assert Core.errors(Bench.agent(bench, :core)) == []
+  end
+
+  test "a read that never completes times out, is counted, and the stream goes on" do
+    {bench, data, n} = run_case(seed: 7, drop_reads: [@base + 512], timeout: 200, laps: 3)
+    core = Bench.agent(bench, :core)
+    assert Core.errors(core) == []
+    assert Core.stats(core)[:dropped] >= 1
+    # the last dropped read may still be waiting for its timeout
+    dropped_n = Core.stats(core)[:dropped]
+    assert Bench.output(bench, :err_count) in [dropped_n - 1, dropped_n]
+    got = stream_bytes(bench)
+    want = :binary.copy(data, 3)
+    # everything outside the dropped request's bytes arrives intact
+    dropped = for lap <- 0..2, off <- 512..(512 + 255), into: MapSet.new(), do: lap * 2048 + off
+
+    for i <- 0..(n * 32 - 1), not MapSet.member?(dropped, i) do
+      assert :binary.at(got, i) == :binary.at(want, i), "byte #{i}"
+    end
+  end
+
+  test "without a timeout a dropped read stalls the stream" do
+    {bench, _data, _n} = run_case(seed: 7, laps: 0, drop_reads: [@base + 256], timeout: nil)
+    bench = Bench.run(bench, 3_000)
+    assert length(Sink.beats(Bench.agent(bench, :sink))) <= 8
+    assert Bench.output(bench, :err_count) == 0
   end
 
   @tag :verilator

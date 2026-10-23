@@ -125,7 +125,7 @@ defmodule ExPcie.Test.Tops do
   end
 
   @doc "H2c behind RqMux (the other mux input is tied off)."
-  def h2c do
+  def h2c(opts \\ []) do
     module "h2c_top" do
       m = master(:m_axis, Interface.axi_stream(data: 256, keep: false, last: false))
       rq = master(:rq, Ifc.rq())
@@ -138,7 +138,7 @@ defmodule ExPcie.Test.Tops do
       ptr = output(:ptr, 32)
       err = output(:err_count, 16)
 
-      h = instance(:h, ExPcie.RTL.H2c.build())
+      h = instance(:h, ExPcie.RTL.H2c.build(opts))
       x = instance(:x, ExPcie.RTL.RqMux.build())
       ic = instance(:ic, ExPcie.RTL.IrqCtrl.build(vectors: 1))
       irq_ports(ic)

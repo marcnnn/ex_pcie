@@ -18,7 +18,7 @@ Alibaba AS02MC04 (XCKU3P) where DMA latency matters more than bandwidth.
 | Descriptor rings in host memory (scatter-gather) | not done; contiguous rings only, see Limits |
 | On hardware | nothing has run on a card |
 
-`mix test` runs 70 tests (about 40 s): codecs, register file, bridge,
+`mix test` runs 71 tests and 4 properties (about 100 s): codecs, register file, bridge,
 both channels, endpoint, host stack against the simulated card, Verilator
 lint and replay, a Yosys synthesis. Tests tagged `:verilator`, `:yosys`,
 `:nif` skip themselves when the tool or the NIF is missing.
@@ -203,6 +203,11 @@ agrees with the core.
 * H2C requests are at most 256 bytes, at most eight outstanding; after
   clearing `run`, completions still in flight are ignored through the tag
   generation, not waited for.
+* H2C completion timeout: the oldest outstanding read gives up after
+  `H2c.build(timeout: cycles)` (default 50_000, 200 us) without progress;
+  its bytes in the stream are then undefined and `h2c_err` counts it.
+  Only the head slot is timed, so a lost read behind it times out once it
+  becomes the head. C2H writes are posted and have no timeout.
 * MMIO: 1 to 4 DWords per TLP, one request at a time, BAR0 only (other
   BARs get UR for reads). Atomics, I/O and locked reads get UR.
 * Interrupts: no timeout for a core that never answers; legacy INTx not

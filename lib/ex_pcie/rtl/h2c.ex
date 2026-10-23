@@ -31,6 +31,16 @@ defmodule ExPcie.RTL.H2c do
   delivered period), `err_count` (completions with error status, poison,
   or an unknown tag of the current generation, counted only while running; an errored request is completed with whatever data
   the slot holds so the stream does not stall).
+
+  Completion timeout: option `timeout:` (cycles, default 50_000 = 200 us at
+  250 MHz, inside the PCIe range of 50 us to 50 ms; `nil` disables). When
+  the oldest outstanding request (the slot that blocks the stream) has
+  made no progress for that long, it is completed with whatever its slot
+  holds and counted in `err_count`. A per-slot epoch bit in the tag
+  (bit 6) flips at every allocation, so a completion arriving after its
+  request timed out is dropped instead of landing in the next request of
+  that slot (it is only accepted again if the slot was reallocated an
+  even number of times in between).
   """
   use ExHdl.RTL
   alias ExPcie.RTL.{Ifc, Util}
@@ -38,7 +48,10 @@ defmodule ExPcie.RTL.H2c do
   @slots 8
   @rows 8
 
-  def build(_opts \\ []) do
+  def build(opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 50_000)
+    tw = if timeout, do: max(1, Integer.digits(timeout, 2) |> length()), else: 1
+
     module "pcie_h2c" do
       m = master(:m_axis, Interface.axi_stream(data: 256, keep: false, last: false))
       rq = master(:rq, Ifc.rq())
@@ -68,6 +81,7 @@ defmodule ExPcie.RTL.H2c do
       s_len = for i <- 0..(@slots - 1), do: reg(:"s_len#{i}", 7)
       s_got = for i <- 0..(@slots - 1), do: reg(:"s_got#{i}", 7)
       s_busy = for i <- 0..(@slots - 1), do: reg(:"s_busy#{i}", 1)
+      s_ep = for i <- 0..(@slots - 1), do: reg(:"s_ep#{i}", 1)
       release = wire(:slot_rel, 1)
       err_count = reg(:err_count_r, 16)
 
@@ -88,13 +102,14 @@ defmodule ExPcie.RTL.H2c do
       new_off = wire(:new_off, add_wrap(req_off, zext(bytes, 32)))
       wrap = wire(:wrap, new_off == ring)
       alloc = wire(:alloc, active and count < @slots and not rq_v)
+      new_ep = wire(:new_ep, not mux(atail, s_ep))
 
       desc =
         Util.desc(:rq, %{
           address: req_addr,
           dw_count: cat([beats, const(0, 3)]),
           req_type: :mem_read,
-          tag: cat([const(0, 2), gen, atail])
+          tag: cat([const(0, 1), new_ep, gen, atail])
         })
 
       # -- completion stage 0: register the beat
@@ -120,8 +135,9 @@ defmodule ExPcie.RTL.H2c do
 
       # -- completion stage 1: decode, place, account
       tag0 = wire(:tag0, r0d[64..66])
-      tag_ok0 = wire(:tag_ok0, r0d[67..69] == gen and r0d[70..71] == 0)
-      stale0 = wire(:stale0, r0d[67..69] != gen and r0d[70..71] == 0)
+      ep_ok0 = wire(:ep_ok0, r0d[70] == mux(r0d[64..66], s_ep))
+      tag_ok0 = wire(:tag_ok0, r0d[67..69] == gen and ep_ok0 and r0d[71] == 0)
+      stale0 = wire(:stale0, (r0d[67..69] != gen or not ep_ok0) and r0d[71] == 0)
       bc0 = wire(:bc0, r0d[18..28])
       dwc0 = wire(:dwc0, r0d[32..42])
       bad0 = wire(:bad0, r0d[43..45] != 0 or r0d[46] or r0d[12..15] != 0)
@@ -173,6 +189,24 @@ defmodule ExPcie.RTL.H2c do
 
       head_ready = wire(:head_ready, count > 0 and mux(head, s_got) == mux(head, s_len))
       orows = wire(:orows, mux(head, s_len)[3..6])
+
+      # -- completion timeout on the head slot (the only one that blocks the stream)
+      tmo_hit =
+        if timeout do
+          tmo = reg(:tmo, tw)
+          waiting = wire(:tmo_wait, active and count > 0 and not head_ready)
+          progress = wire(:tmo_prog, upd and tag_e == head)
+          hit = wire(:tmo_hit, waiting and not progress and tmo == timeout - 1)
+
+          sync do
+            tmo <~ mux(waiting and not progress and not hit, add_wrap(tmo, 1), const(0, tw))
+          end
+
+          hit
+        else
+          wire(:tmo_hit, const(0, 1))
+        end
+
       advance = wire(:advance, active and head_ready and (not ov or m.tready))
       last_row = wire(:last_row, orow + 1 == orows)
       release <~ (advance and last_row)
@@ -204,6 +238,7 @@ defmodule ExPcie.RTL.H2c do
           if upd and tag_e == i, do: Enum.at(s_got, i) <~ new_got
 
           if alloc and atail == i do
+            Enum.at(s_ep, i) <~ new_ep
             Enum.at(s_len, i) <~ cat([beats, const(0, 3)])
             Enum.at(s_got, i) <~ 0
             Enum.at(s_busy, i) <~ 1
@@ -213,6 +248,10 @@ defmodule ExPcie.RTL.H2c do
         end
 
         count <~ add_wrap(sub_wrap(count, zext(release, 4)), zext(alloc, 4))
+
+        for i <- 0..(@slots - 1) do
+          if tmo_hit and head == i, do: Enum.at(s_got, i) <~ Enum.at(s_len, i)
+        end
 
         if r0v do
           cur_tag <~ tag_e
@@ -224,6 +263,9 @@ defmodule ExPcie.RTL.H2c do
           if r0f and active and (bad0 or not ok0) and not stale0,
             do: err_count <~ add_wrap(err_count, 1)
         end
+
+        # both in one cycle: the timeout wins, an error completion is rare
+        if tmo_hit, do: err_count <~ add_wrap(err_count, 1)
 
         if advance do
           ov <~ 1
