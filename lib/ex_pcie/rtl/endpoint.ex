@@ -12,24 +12,28 @@ defmodule ExPcie.RTL.Endpoint do
 
   ## BAR0 register map (32-bit, byte offsets, 16 KiB)
 
-  | Offset | Name | Access | Meaning |
-  |---|---|---|---|
-  | 0x000 | `ID` | ro | `0x50434945` |
-  | 0x004 | `CAPS` | ro | `[7:0]` vectors, `[15:8]` stream bytes per beat |
-  | 0x010 | `CTRL` | rw | bit 0 H2C run, bit 1 C2H run |
-  | 0x014 | `STATUS` | w1c | bit 0 H2C period, 1 C2H period, 2 H2C error seen |
-  | 0x020-0x02C | `H2C_BASE_LO/HI`, `H2C_RING`, `H2C_PERIOD` | rw | ring in host memory |
-  | 0x030 | `H2C_PTR` | ro | bytes delivered, modulo ring |
-  | 0x034 | `H2C_ERR` | ro | completion errors |
-  | 0x040-0x04C | `C2H_BASE_LO/HI`, `C2H_RING`, `C2H_PERIOD` | rw | ring in host memory |
-  | 0x050 | `C2H_PTR` | ro | bytes written, modulo ring |
-  | 0x054 | `C2H_PKT` | ro | TLPs written |
-  | 0x060 | `IRQ_FORCE` | pulse | raise the vectors in the written bits |
-  | 0x064 | `IRQ_PENDING` | ro | pending vectors |
-  | 0x068 | `BRIDGE_ERR` | ro | `[15:0]` UR completions, `[31:16]` dropped |
-  | 0x06C | `AXIL_ERR` | ro | AXI-Lite error responses |
-  | 0x1000 + 16 i | MSI-X table | rw | `ADDR_LO`, `ADDR_HI`, `DATA`, `CTRL` (bit 0 mask, reset 1) |
-  | 0x2000 | PBA | ro | pending bits |
+  Declared in `ExPcie.Regs` (`defregs`-style map; the module has the table,
+  `ExPcie.Regs.c_header/1` and `markdown/1` render it). Summary: `id` at
+  0x000, `caps` 0x004, `ctrl` 0x010 (bit 0 H2C run, bit 1 C2H run),
+  `status` 0x014 (w1c), the channel registers at 0x020 (H2C) and 0x040
+  (C2H), `irq_force` 0x060, counters up to 0x06C, the MSI-X table at
+  0x1000 + 16 i and the PBA at 0x2000.
+
+  ## More register slaves behind the same BAR
+
+  `extra:` is a list of `%{name: atom, base: byte offset, module: m}` where
+  `m` is an AXI4-Lite slave module (`s_axil` bundle, e.g. the `rtl/0` of
+  an `ExHdl.Regs` map) and `base` a multiple of its size
+  (`2^address bits`) at or above 0x4000. The endpoint puts
+  `ExHdlCores.AXIL.interconnect/2` between the BAR0 bridge and all slaves,
+  instantiates each module and re-exports its other ports with the prefix
+  `<name>_` (`mixer_ctrl_enable`, ...); clock and reset are shared. An
+  entry without `module:` (but with `size:`) exposes the AXI4-Lite master
+  bundle `<name>_axil` instead, for a slave elsewhere. The BAR0 aperture
+  of the core must cover the highest range; accesses to unmapped
+  addresses complete with SLVERR (read: Completer Abort), as holes inside
+  the endpoint's own map. Without `extra:` the bridge drives the endpoint
+  registers directly.
 
   With `loopback: true` the user streams are not exposed: the H2C
   stream feeds the C2H stream inside (a packet every four beats), a
@@ -41,63 +45,69 @@ defmodule ExPcie.RTL.Endpoint do
   run bit; clearing the run bit resets it.
   """
   use ExHdl.RTL
-  alias ExPcie.RTL.{AxilRegs, Bar0Bridge, Dma, Ifc, IrqCtrl}
+  alias ExHdl.RTL.{Builder, Module}
+  alias ExHdlCores.AXIL
+  alias ExPcie.RTL.{Bar0Bridge, Dma, Ifc, IrqCtrl}
+  alias ExPcie.Regs
 
-  @id 0x50434945
+  @core_size 0x4000
 
-  @doc "Register map entries for `AxilRegs`: `%{name, offset, kind, width}` (also used by host code)."
-  def regs(vectors \\ 2) do
-    base = [
-      %{name: :id, offset: 0x000, kind: :ro},
-      %{name: :caps, offset: 0x004, kind: :ro},
-      %{name: :ctrl, offset: 0x010, kind: :rw, width: 2},
-      %{name: :status, offset: 0x014, kind: :w1c, width: 3},
-      %{name: :h2c_base_lo, offset: 0x020, kind: :rw},
-      %{name: :h2c_base_hi, offset: 0x024, kind: :rw},
-      %{name: :h2c_ring, offset: 0x028, kind: :rw},
-      %{name: :h2c_period, offset: 0x02C, kind: :rw},
-      %{name: :h2c_ptr, offset: 0x030, kind: :ro},
-      %{name: :h2c_err, offset: 0x034, kind: :ro},
-      %{name: :c2h_base_lo, offset: 0x040, kind: :rw},
-      %{name: :c2h_base_hi, offset: 0x044, kind: :rw},
-      %{name: :c2h_ring, offset: 0x048, kind: :rw},
-      %{name: :c2h_period, offset: 0x04C, kind: :rw},
-      %{name: :c2h_ptr, offset: 0x050, kind: :ro},
-      %{name: :c2h_pkt, offset: 0x054, kind: :ro},
-      %{name: :irq_force, offset: 0x060, kind: :pulse, width: vectors},
-      %{name: :irq_pending, offset: 0x064, kind: :ro},
-      %{name: :bridge_err, offset: 0x068, kind: :ro},
-      %{name: :axil_err, offset: 0x06C, kind: :ro},
-      %{name: :pba, offset: 0x2000, kind: :ro}
-    ]
+  @doc false
+  # Normalised extra slaves: `%{name, base, size, module}`.
+  def extras(list) do
+    items =
+      for e <- list do
+        size =
+          case e do
+            %{module: %Module{} = m} ->
+              m
+              |> Module.port(:s_axil_awaddr)
+              |> Map.fetch!(:type)
+              |> elem(1)
+              |> then(&Bitwise.bsl(1, &1))
 
-    table =
-      for i <- 0..(vectors - 1),
-          {n, o, k, w} <- [
-            {:lo, 0, :rw, 32},
-            {:hi, 4, :rw, 32},
-            {:data, 8, :rw, 32},
-            {:ctrl, 12, :rw, 1}
-          ] do
-        %{
-          name: :"msix#{i}_#{n}",
-          offset: 0x1000 + 16 * i + o,
-          kind: k,
-          width: w,
-          reset: if(n == :ctrl, do: 1, else: 0)
-        }
+            %{size: size} ->
+              size
+          end
+
+        %{name: e.name, base: e.base, size: size, module: Map.get(e, :module)}
       end
 
-    base ++ table
+    for e <- items,
+        e.base < @core_size,
+        do: raise(ArgumentError, "extra slave #{e.name}: base must be at or above 0x4000")
+
+    items
   end
 
   def build(opts \\ []) do
     vectors = Keyword.get(opts, :vectors, 2)
     loopback = Keyword.get(opts, :loopback, false)
-    ab = 14
-    regfile = AxilRegs.build("pcie_endpoint_regs_#{vectors}", regs(vectors), addr_bits: ab)
+    extra = extras(Keyword.get(opts, :extra, []))
 
-    module "pcie_endpoint_#{vectors}#{if loopback, do: "_loopback", else: ""}" do
+    ab =
+      extra
+      |> Enum.map(&(&1.base + &1.size))
+      |> Enum.max(fn -> @core_size end)
+      |> Builder.ceil_log2()
+      |> max(14)
+
+    regfile = Regs.rtl(vectors)
+
+    xbar =
+      if extra != [],
+        do:
+          AXIL.interconnect([%{base: 0, size: @core_size} | extra],
+            addr_bits: ab,
+            unmapped: :slverr
+          )
+
+    tag =
+      if extra == [],
+        do: "",
+        else: "_x" <> Enum.map_join(extra, "_", &"#{&1.name}#{Integer.to_string(&1.base, 16)}")
+
+    module "pcie_endpoint_#{vectors}#{if loopback, do: "_loopback", else: ""}#{tag}" do
       cq = slave(:cq, Ifc.cq())
       cc = master(:cc, Ifc.cc())
       rq = master(:rq, Ifc.rq())
@@ -141,7 +151,44 @@ defmodule ExPcie.RTL.Endpoint do
 
       connect(cq, br.cq)
       connect(br.cc, cc)
-      connect(br.m_axil, rf.s_axil)
+
+      if xbar do
+        x = instance(:xbar, xbar)
+        connect(br.m_axil, x.s_axil)
+        connect(x.m0_axil, rf.s_axil)
+
+        for {e, n} <- Enum.with_index(extra, 1) do
+          m = x[:"m#{n}_axil"]
+
+          case e.module do
+            nil ->
+              connect(
+                m,
+                master(
+                  :"#{e.name}_axil",
+                  Interface.axi_lite(addr: Builder.ceil_log2(e.size), data: 32)
+                )
+              )
+
+            mod ->
+              inst = instance(:"u_#{e.name}", mod)
+              connect(m, inst.s_axil)
+
+              for p <- mod.ports,
+                  p.role == :data,
+                  not String.starts_with?("#{p.name}", "s_axil_") do
+                port = :"#{e.name}_#{p.name}"
+
+                if p.dir == :input,
+                  do: inst[p.name] <~ input(port, p.type),
+                  else: output(port, p.type) <~ inst[p.name]
+              end
+          end
+        end
+      else
+        connect(br.m_axil, rf.s_axil)
+      end
+
       np_req <~ br.cq_np_req
       connect(dma.rq, rq)
       connect(rc, dma.rc)
@@ -164,20 +211,18 @@ defmodule ExPcie.RTL.Endpoint do
       dma.cfg_max_payload <~ mps
       dma.cfg_max_read_req <~ mrrs
 
-      rf.id <~ @id
-      rf.caps <~ (vectors ||| 32 <<< 8)
-      dma.h2c_run <~ rf.ctrl[0]
-      dma.c2h_run <~ rf.ctrl[1]
+      dma.h2c_run <~ rf.ctrl_h2c_run
+      dma.c2h_run <~ rf.ctrl_c2h_run
 
       for ch <- [:h2c, :c2h] do
-        dma[:"#{ch}_base"] <~ cat([rf[:"#{ch}_base_hi"], rf[:"#{ch}_base_lo"]])
-        dma[:"#{ch}_ring_bytes"] <~ rf[:"#{ch}_ring"]
-        dma[:"#{ch}_period_bytes"] <~ rf[:"#{ch}_period"]
-        rf[:"#{ch}_ptr"] <~ dma[:"#{ch}_ptr"]
+        dma[:"#{ch}_base"] <~ cat([rf[:"#{ch}_base_hi_value"], rf[:"#{ch}_base_lo_value"]])
+        dma[:"#{ch}_ring_bytes"] <~ rf[:"#{ch}_ring_value"]
+        dma[:"#{ch}_period_bytes"] <~ rf[:"#{ch}_period_value"]
+        rf[:"#{ch}_ptr_value"] <~ dma[:"#{ch}_ptr"]
       end
 
-      rf.h2c_err <~ zext(dma.h2c_err_count, 32)
-      rf.c2h_pkt <~ zext(dma.c2h_pkt_count, 32)
+      rf.h2c_err_value <~ zext(dma.h2c_err_count, 32)
+      rf.c2h_pkt_value <~ zext(dma.c2h_pkt_count, 32)
 
       err_prev = reg(:err_prev, 16)
       err_ev = wire(:err_ev, dma.h2c_err_count != err_prev)
@@ -186,21 +231,29 @@ defmodule ExPcie.RTL.Endpoint do
         err_prev <~ dma.h2c_err_count
       end
 
-      rf.status_set <~ cat([err_ev, dma.c2h_irq, dma.h2c_irq])
-      status_o <~ rf.status
+      rf.status_h2c_period_set <~ dma.h2c_irq
+      rf.status_c2h_period_set <~ dma.c2h_irq
+      rf.status_h2c_error_set <~ err_ev
+      status_o <~ cat([rf.status_h2c_error, rf.status_c2h_period, rf.status_h2c_period])
 
-      ic.req <~ (zext(cat([dma.c2h_irq, dma.h2c_irq]), vectors) ||| rf.irq_force)
+      ic.req
+      <~ (zext(cat([dma.c2h_irq, dma.h2c_irq]), vectors) |||
+            (rf.irq_force_vec &&& rep(rf.irq_force_wr, vectors)))
+
       idx = 0..(vectors - 1)
 
       ic.tbl_addr
-      <~ cat(for i <- Enum.reverse(idx), do: cat([rf[:"msix#{i}_hi"], rf[:"msix#{i}_lo"]]))
+      <~ cat(
+        for i <- Enum.reverse(idx), do: cat([rf[:"msix#{i}_hi_value"], rf[:"msix#{i}_lo_value"]])
+      )
 
-      ic.tbl_data <~ cat(for i <- Enum.reverse(idx), do: rf[:"msix#{i}_data"])
-      ic.tbl_mask <~ cat(for i <- Enum.reverse(idx), do: rf[:"msix#{i}_ctrl"])
-      rf.pba <~ zext(ic.pending, 32)
-      rf.irq_pending <~ zext(ic.pending, 32)
-      rf.bridge_err <~ cat([br.drop_count, br.ur_count])
-      rf.axil_err <~ zext(br.axil_err_count, 32)
+      ic.tbl_data <~ cat(for i <- Enum.reverse(idx), do: rf[:"msix#{i}_data_value"])
+      ic.tbl_mask <~ cat(for i <- Enum.reverse(idx), do: rf[:"msix#{i}_ctrl_mask"])
+      rf.pba_value <~ zext(ic.pending, 32)
+      rf.irq_pending_value <~ zext(ic.pending, 32)
+      rf.bridge_err_ur <~ br.ur_count
+      rf.bridge_err_dropped <~ br.drop_count
+      rf.axil_err_value <~ zext(br.axil_err_count, 32)
     end
   end
 end

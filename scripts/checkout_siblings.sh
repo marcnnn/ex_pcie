@@ -4,5 +4,4 @@ set -e
 BASE=${SIBLINGS_BASE:-https://github.com/$(dirname "${GITHUB_REPOSITORY:-x/y}")}
 [ -d ../nx_fixed ] || git clone --depth 1 "$BASE/nx_fixed.git" ../nx_fixed
 [ -d ../exhdl ] || git clone --depth 1 "$BASE/exhdl.git" ../exhdl
-
-
+[ -d ../ex_hdl_cores ] || git clone --depth 1 "$BASE/ex_hdl_cores.git" ../ex_hdl_cores

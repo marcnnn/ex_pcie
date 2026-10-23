@@ -18,7 +18,7 @@ Alibaba AS02MC04 (XCKU3P) where DMA latency matters more than bandwidth.
 | Descriptor rings in host memory (scatter-gather) | not done; contiguous rings only, see Limits |
 | On hardware | nothing has run on a card |
 
-`mix test` runs 60+ tests (about 40 s): codecs, register file, bridge,
+`mix test` runs 70 tests (about 40 s): codecs, register file, bridge,
 both channels, endpoint, host stack against the simulated card, Verilator
 lint and replay, a Yosys synthesis. Tests tagged `:verilator`, `:yosys`,
 `:nif` skip themselves when the tool or the NIF is missing.
@@ -33,8 +33,9 @@ lint and replay, a Yosys synthesis. Tests tagged `:verilator`, `:yosys`,
    Bar0Bridge      H2c ◄── RC     C2h ──► RqMux ── RQ
    (CQ→AXI-Lite→CC)  │ rq ───────────────────▲
         │            ▼                   ▲
-   AxilRegs      user stream        user stream
-   (BAR0 map, MSI-X table)           IrqCtrl ── cfg_interrupt_msix / msi
+   AXIL interconnect  user stream     user stream
+   ├ ExPcie.Regs (BAR0 map, MSI-X table)  IrqCtrl ── cfg_interrupt_msix / msi
+   └ more defregs slaves (mixer, PTP, ...)
 ```
 
 | Module | Role |
@@ -44,16 +45,16 @@ lint and replay, a Yosys synthesis. Tests tagged `:verilator`, `:yosys`,
 | `ExPcie.Axis` | beats (`data`, DWord `keep`, `last`, `user`) and the conversion to and from TLPs |
 | `ExPcie.RTL.Ifc` | the four streams as ExHdl interfaces |
 | `ExPcie.RTL.Bar0Bridge` | completer: 1 to 4 DWord MMIO reads and writes, completions, UR and CA handling |
-| `ExPcie.RTL.AxilRegs` | AXI4-Lite register file generator (`:rw`, `:ro`, `:w1c`, `:pulse`) |
+| `ExPcie.Regs` | the BAR0 register map as an `ExHdl.Regs` map: AXI4-Lite slave, host offsets and encode/decode, C header, Markdown |
 | `ExPcie.RTL.H2c`, `C2h` | the DMA channels |
-| `ExPcie.RTL.RqMux` | packet arbiter for the single RQ stream |
+| `ExPcie.RTL.RqMux` | packet arbiter for the single RQ stream (wraps `ExHdlCores.AXIS.packet_mux/2`) |
 | `ExPcie.RTL.IrqCtrl` | MSI-X (table in BAR0) and MSI requests, retry on failure |
-| `ExPcie.RTL.Dma`, `Endpoint` | both channels with the mux; the whole endpoint (`loopback: true` loops the user streams for self-test) |
+| `ExPcie.RTL.Dma`, `Endpoint` | both channels with the mux; the whole endpoint (`loopback: true` loops the user streams for self-test; `extra:` adds register slaves behind the BAR) |
 | `ExPcie.Model.Core` | BEAM model of the hard block and the host (memory, completer, requester, interrupts) |
 | `ExPcie.Model.Bench`, `Agent`, `Stream`, `Pins` | closed-loop bench around `ExHdl.RTL.Sim`, records the stimulus for Verilator |
 | `ExPcie.Dma.Ref` | timing-free reference: TLP segmentation, ring contents, read requests |
 | `ExPcie.Device` (`Mock`, `Sysfs`, `Vfio`), `ExPcie.Nif` | host access |
-| `ExPcie.Host` | driver for the endpoint's register map, rings, pointers, interrupts |
+| `ExPcie.Host` | driver for the endpoint's register map (offsets from `ExPcie.Regs`), rings, pointers, interrupts |
 | `ExPcie.Sim.Card` | the endpoint RTL in the simulator behind a mock `ExPcie.Device` |
 
 ### DMA channels
@@ -82,14 +83,45 @@ pointer registers and the period interrupts.
   top. Periods are free: the audio period (1 ms or 64 frames) is just
   `period_bytes`, and `tlast` flushes sub-period TLPs.
 * Resources (Yosys, `synth_xilinx -family xcup`, whole endpoint): about
-  4.5k LUT, 3.9k FF, 77 LUTRAM cells, no BRAM or DSP (`C2h.build(style:
+  3.8k LUT, 3.9k FF, 77 LUTRAM cells, no BRAM or DSP (`C2h.build(style:
   :block)` uses 8 RAMB18 instead of LUTRAM).
 
-### BAR0 map
+### BAR0 map and more register slaves
 
-See `ExPcie.RTL.Endpoint` (ID `0x50434945` at 0, control at 0x10, per
-channel `BASE_LO/HI`, `RING`, `PERIOD`, `PTR`, MSI-X table at 0x1000, PBA
-at 0x2000). `ExPcie.Host.offset/1` reads it from the same list.
+The endpoint's registers are declared once in `ExPcie.Regs` (`ExHdl.Regs`,
+`defregs` style): ID `0x50434945` at 0, `caps` at 4, `ctrl` at 0x10, per
+channel `base_lo/hi`, `ring`, `period`, `ptr`, MSI-X table at 0x1000
+(16 bytes per vector), PBA at 0x2000; `ExPcie.Regs.markdown/1` and
+`c_header/1` print the table. `ExPcie.Host.offset/1` reads the same map,
+`ExPcie.Host.fields/2` and `write_fields/3` decode and encode by field
+name. The offsets are the ones of the register file this replaced
+(`test/regs_test.exs` pins them). What changed: register ports are named
+`<reg>_<field>` (`ctrl_h2c_run`, `status_h2c_error_set`), `id` and `caps`
+are constants, `irq_force` is a write-only field with a strobe, and the
+slave is `ExHdl.Regs.RTL` (one access at a time, byte strobes, SLVERR for
+holes).
+
+Further `defregs` slaves (audio mixer, PTP readout, ...) live behind the
+same BAR0: the endpoint then puts `ExHdlCores.AXIL.interconnect/2` between
+the bridge and the slaves.
+
+```elixir
+Endpoint.build(extra: [
+  %{name: :mixer, base: 0x4000, module: Mixer.Regs.rtl()},   # 4 KiB at 0x4000
+  %{name: :ptp, base: 0x8000, module: Ptp.Regs.rtl()},
+  %{name: :ext, base: 0x10000, size: 0x1000}                 # AXI4-Lite master port instead
+])
+```
+
+`base` is a multiple of the slave's size (`2^address bits` of its
+`s_axil`), at or above 0x4000 (the endpoint's own range is 0x0000 to
+0x3FFF). The ports of each module come out with the prefix `<name>_`
+(`mixer_ctrl_enable`, `ptp_time_lo_value`, ...); `ext` exposes
+`ext_axil_*`. The core's BAR0 aperture must cover the highest range.
+Unmapped addresses between and above the slaves complete with SLVERR (a
+read becomes a Completer Abort, a write counts in `axil_err`). The access
+latency of the extra slaves is the interconnect's (two cycles) plus the
+slave's. Without `extra:` there is no interconnect.
 
 ## Host side
 
@@ -182,7 +214,7 @@ agrees with the core.
 ## Development
 
 ```sh
-./scripts/checkout_siblings.sh   # path dependency on ../exhdl
+./scripts/checkout_siblings.sh   # path dependencies on ../exhdl and ../ex_hdl_cores
 mix test
 mix format --check-formatted && mix compile --warnings-as-errors
 ```

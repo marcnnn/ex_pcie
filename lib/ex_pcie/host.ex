@@ -21,13 +21,21 @@ defmodule ExPcie.Host do
   import Bitwise
   alias ExPcie.Device
   alias ExPcie.Device.DmaBuffer
-  alias ExPcie.RTL.Endpoint
+  alias ExPcie.Regs
 
   @id 0x50434945
-  @regs Map.new(Endpoint.regs(8), &{&1.name, &1.offset})
+  @map Regs.map(32)
+  @regs Map.new(@map.registers, &{&1.name, &1.offset})
 
-  @doc "Byte offset of a BAR0 register (`ExPcie.RTL.Endpoint` register map)."
+  @doc "Byte offset of a BAR0 register (`ExPcie.Regs` register map)."
   def offset(name), do: Map.fetch!(@regs, name)
+
+  @doc "Reads a register and splits it into its fields (`ExPcie.Regs.decode/2`)."
+  def fields(dev, name), do: ExHdl.Regs.decode(@map, name, read(dev, name))
+
+  @doc "Writes a register from field values (unnamed fields take their reset value)."
+  def write_fields(dev, name, fields),
+    do: write(dev, name, ExHdl.Regs.encode(@map, name, fields))
 
   @doc "MSI-X vector of a channel: `:h2c` 0, `:c2h` 1."
   def vector(:h2c), do: 0

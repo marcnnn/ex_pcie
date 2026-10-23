@@ -23,6 +23,7 @@ defmodule ExPcie.MixProject do
   defp deps do
     [
       {:ex_hdl, path: "../exhdl"},
+      {:ex_hdl_cores, path: "../ex_hdl_cores"},
       {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]
   end

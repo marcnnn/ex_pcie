@@ -12,9 +12,7 @@ defmodule ExPcie.RTL.EndpointTest do
   @msix0 {0xFEE0_1000, 0x40}
   @msix1 {0xFEE0_2000, 0x41}
 
-  defp reg(name) do
-    Endpoint.regs() |> Enum.find(&(&1.name == name)) |> Map.fetch!(:offset)
-  end
+  defp reg(name), do: ExPcie.Regs.offset(name)
 
   defp host(b, f), do: Bench.update(b, :core, f)
   defp core(b), do: Bench.agent(b, :core)

@@ -33,6 +33,10 @@ defmodule ExPcie.HostTest do
 
     test "id, argument checks", %{dev: dev} do
       assert :ok = Host.check_id(dev)
+      assert %{vectors: 2, stream_bytes: 32} = Host.fields(dev, :caps)
+      :ok = Host.write_fields(dev, :ctrl, h2c_run: 1)
+      assert %{h2c_run: 1, c2h_run: 0} = Host.fields(dev, :ctrl)
+      :ok = Host.write_fields(dev, :ctrl, [])
       {:ok, buf} = Device.alloc_dma(dev, 4096)
       assert {:error, :bad_ring_or_period} = Host.start_c2h(dev, buf, period: 96)
       assert {:error, :unaligned_base} = Host.start_c2h(dev, buf, period: 64, offset: 16)

@@ -59,14 +59,20 @@ open therefore fails to build. Workaround: route every child output to a
 port. Wish: pragma on instance wires (or an `unused: [:y]` instance
 option) so top levels need not invent ports.
 
-### 3. `defregs`
+### 3. `defregs` (done, two wishes left)
 
-`ExPcie.RTL.AxilRegs` is a small generator with the register kinds the
-endpoint needs (`:rw`, `:ro`, `:w1c`, `:pulse`, byte strobes, SLVERR for
-holes). Once `defregs` exists it should replace it. Needed from it:
-a w1c kind with an event input, a pulse (write-strobe) kind, a reset value
-per register, narrower-than-32-bit fields, and an address map export for
-host code (`ExPcie.Host` reads offsets from `ExPcie.RTL.Endpoint.regs/1`).
+`ExPcie.Regs` replaced the stand-in register file. Left over:
+
+* `defregs` has no pulse kind. The old `:pulse` register (output high for
+  one cycle carrying the written bits) is a `:wo` field with
+  `strobe: :write` plus `kick <~ (reg_field &&& rep(reg_wr, w))` by hand
+  (`ExPcie.RTL.Endpoint`, `irq_force`). Wish: `field :vec, 0..1, :pulse`.
+* The generated `rtl/0` takes no options, so a map that wants SLVERR for
+  holes calls `ExHdl.Regs.RTL.build(map(), unmapped: :slverr)` instead of
+  `Map.rtl()`. Wish: `rtl(opts)` forwarding to `ExHdl.Regs.RTL.build/2`.
+* Port names are `<reg>_<field>`; for single-field registers named
+  `value` that gives `h2c_ring_value`. Wish: an option that drops the
+  field name for a register with one field.
 
 ### 4. Closed-loop co-simulation
 
@@ -117,6 +123,23 @@ auto thresholds would help.
 
 ## ex_hdl_cores
 
-`ExPcie.RTL.RqMux` is a two-input packet arbiter and `AxilRegs` a register
-file; both are generic enough to move to ex_hdl_cores (arbiters, AXI4-Lite
-plumbing) once that library has them.
+Used now: `ExHdlCores.AXIL.interconnect/2` (extra register slaves behind
+BAR0) and `ExHdlCores.AXIS.packet_mux/2` (`RqMux` is a wrapper of it).
+`keep_bits:` in `ExHdlCores.AXIS` covers the one-bit-per-DWord `tkeep` of
+item 5 for the blocks that pass `tkeep` through.
+
+## ExHdl, found while moving to ex_hdl_cores and defregs
+
+* An instance named like a prefix of re-exported ports collides: instance
+  `mixer` with the port `mixer_ctrl_enable` fails with `mixer_ctrl_enable
+  is declared twice`, because instance ports are wires `<inst>_<port>`.
+  `Endpoint` therefore calls its instances `u_<name>`. A helper that
+  forwards all data ports of an instance to top-level ports with a prefix
+  (`expose(inst, prefix: :mixer)`) would replace the loop in
+  `ExPcie.RTL.Endpoint.build/1`; the error could name the instance as a
+  possible cause.
+
+      module "m" do
+        i = instance(:x, child)            # child has the port :y
+        output(:x_y, 1) <~ i.y             # ElaborationError: x_y is declared twice
+      end

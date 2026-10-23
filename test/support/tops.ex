@@ -1,22 +1,36 @@
 defmodule ExPcie.Test.Tops do
   @moduledoc "Test top levels combining the library's RTL blocks."
   use ExHdl.RTL
-  alias ExPcie.RTL.{AxilRegs, Bar0Bridge, Ifc}
+  alias ExPcie.RTL.{Bar0Bridge, Ifc}
 
-  @doc "Bar0Bridge in front of an eight-register scratch file with a read-only, a w1c and a pulse register."
+  use ExHdl.Regs
+
+  @doc "Register map of the bridge test: eight scratch registers, a read-only, a w1c and a pulse register."
+  def bridge_map(ab \\ 12) do
+    regmap "bridge_regs_file_#{ab}", addr_width: ab do
+      for i <- 0..7 do
+        register :"s#{i}", offset: 4 * i do
+          field :value, 0..31, :rw
+        end
+      end
+
+      register :ro_a, offset: 0x20 do
+        field :value, 0..31, :ro
+      end
+
+      register :ev, offset: 0x24 do
+        field :bits, 0..7, :w1c
+      end
+
+      register :kick, offset: 0x28, strobe: :write do
+        field :bits, 0..3, :wo
+      end
+    end
+  end
+
+  @doc "Bar0Bridge in front of `bridge_map/1` (SLVERR for holes, like the endpoint)."
   def bridge_regs(ab \\ 12) do
-    regs =
-      for i <- 0..7, do: %{name: :"s#{i}", offset: 4 * i, kind: :rw}
-
-    regs =
-      regs ++
-        [
-          %{name: :ro_a, offset: 0x20, kind: :ro},
-          %{name: :ev, offset: 0x24, kind: :w1c, width: 8},
-          %{name: :kick, offset: 0x28, kind: :pulse, width: 4}
-        ]
-
-    regfile = AxilRegs.build("bridge_regs_file_#{ab}", regs, addr_bits: ab)
+    regfile = ExHdl.Regs.RTL.build(bridge_map(ab), unmapped: :slverr)
 
     module "bridge_regs_top_#{ab}" do
       cq = slave(:cq, Ifc.cq())
@@ -40,11 +54,11 @@ defmodule ExPcie.Test.Tops do
       ur <~ b.ur_count
       drop <~ b.drop_count
       aerr <~ b.axil_err_count
-      r.ro_a <~ ro_a
-      r.ev_set <~ ev_set
-      kick <~ r.kick
-      ev <~ r.ev
-      for i <- 0..7, do: Enum.at(s, i) <~ r[:"s#{i}"]
+      r.ro_a_value <~ ro_a
+      r.ev_bits_set <~ ev_set
+      kick <~ (r.kick_bits &&& rep(r.kick_wr, 4))
+      ev <~ r.ev_bits
+      for i <- 0..7, do: Enum.at(s, i) <~ r[:"s#{i}_value"]
     end
   end
 
