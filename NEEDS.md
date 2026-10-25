@@ -74,7 +74,7 @@ option) so top levels need not invent ports.
   `value` that gives `h2c_ring_value`. Wish: an option that drops the
   field name for a register with one field.
 
-### 3a. `cat` of a `mux(sel, list)` fails in SystemVerilog generation
+### 3a. `cat` of a `mux(sel, list)` fails in SystemVerilog generation (fixed in exhdl 2df191f)
 
 ```elixir
 use ExHdl.RTL
