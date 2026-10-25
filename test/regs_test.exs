@@ -11,6 +11,7 @@ defmodule ExPcie.RegsTest do
     id: 0x000,
     caps: 0x004,
     ctrl: 0x010,
+    timeout: 0x018,
     status: 0x014,
     h2c_base_lo: 0x020,
     h2c_base_hi: 0x024,
@@ -28,6 +29,28 @@ defmodule ExPcie.RegsTest do
     irq_pending: 0x064,
     bridge_err: 0x068,
     axil_err: 0x06C,
+    h2c_dbase_lo: 0x100,
+    h2c_dbase_hi: 0x104,
+    h2c_dsize: 0x108,
+    h2c_dhead: 0x10C,
+    h2c_dtail: 0x110,
+    h2c_dstat: 0x114,
+    h2c_wb_lo: 0x118,
+    h2c_wb_hi: 0x11C,
+    h2c_dctrl: 0x120,
+    h2c_dcount: 0x124,
+    h2c_dfetch: 0x128,
+    c2h_dbase_lo: 0x140,
+    c2h_dbase_hi: 0x144,
+    c2h_dsize: 0x148,
+    c2h_dhead: 0x14C,
+    c2h_dtail: 0x150,
+    c2h_dstat: 0x154,
+    c2h_wb_lo: 0x158,
+    c2h_wb_hi: 0x15C,
+    c2h_dctrl: 0x160,
+    c2h_dcount: 0x164,
+    c2h_dfetch: 0x168,
     msix0_lo: 0x1000,
     msix0_hi: 0x1004,
     msix0_data: 0x1008,
@@ -47,7 +70,7 @@ defmodule ExPcie.RegsTest do
   test "host helpers" do
     assert Regs.encode(:ctrl, h2c_run: 1, c2h_run: 1) == 3
     assert Regs.decode(:status, 0b101) == %{h2c_period: 1, c2h_period: 0, h2c_error: 1}
-    assert Regs.decode(:caps, 2 ||| 32 <<< 8) == %{vectors: 2, stream_bytes: 32}
+    assert Regs.decode(:caps, 2 ||| 32 <<< 8) == %{vectors: 2, stream_bytes: 32, desc: 0}
     assert Regs.encode(:msix0_ctrl, []) == 1
     assert Regs.c_header() =~ "0x00000010"
     assert Regs.markdown() =~ "h2c_run"
@@ -61,7 +84,7 @@ defmodule ExPcie.RegsTest do
     d = driver(4, delays: 0..2, seed: 3)
     assert {0x50434945, :okay, d} = SimDriver.read(d, Regs.offset(:id))
     assert {c, :okay, d} = SimDriver.read(d, Regs.offset(:caps))
-    assert Regs.decode(:caps, c) == %{vectors: 4, stream_bytes: 32}
+    assert Regs.decode(:caps, c) == %{vectors: 4, stream_bytes: 32, desc: 1}
     assert {1, :okay, d} = SimDriver.read(d, Regs.offset(:msix3_ctrl))
 
     {:okay, d} = SimDriver.write(d, Regs.offset(:ctrl), 3)
@@ -81,8 +104,8 @@ defmodule ExPcie.RegsTest do
     assert SimDriver.peek(d, :irq_force_vec) == 0b0110
 
     # holes and writes to read-only registers
-    assert {0, :slverr, d} = SimDriver.read(d, 0x0100)
-    {:slverr, d} = SimDriver.write(d, 0x0100, 1)
+    assert {0, :slverr, d} = SimDriver.read(d, 0x0200)
+    {:slverr, d} = SimDriver.write(d, 0x0200, 1)
     {:okay, d} = SimDriver.write(d, Regs.offset(:h2c_ptr), 5)
     assert {0, :okay, _} = SimDriver.read(d, Regs.offset(:h2c_ptr))
   end

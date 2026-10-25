@@ -14,20 +14,32 @@ defmodule ExPcie.Model.Bench do
   `sample/3`, clock. The inputs of every cycle are recorded;
   `compare_verilator/1` replays exactly that stimulus in Verilator and
   checks all outputs match the BEAM simulation cycle by cycle.
+
+  With `engine: :verilator` the design runs in a Verilator process instead
+  (`ExHdl.RTL.Cosim.Session`, the same poke/outputs/step calls), so the
+  agents close the loop against the synthesisable netlist itself; call
+  `close/1` when done. The BEAM simulator is the default.
   """
   alias ExHdl.RTL.{Cosim, Module, Sim}
+  alias ExHdl.RTL.Cosim.Session
 
-  defstruct [:module, :sim, :inputs, :idle, agents: [], cycle: 0, trace: [], outputs: %{}]
+  defstruct [:module, :sim, :impl, :inputs, :idle, agents: [], cycle: 0, trace: [], outputs: %{}]
 
-  @doc "New bench. Agents are keyword entries `name: state`; the state's struct module is the agent. `idle:` are inputs held during reset."
+  @doc "New bench. Agents are keyword entries `name: state`; the state's struct module is the agent. `idle:` are inputs held during reset; `engine:` `:beam` (default) or `:verilator`."
   def new(%Module{} = mod, agents \\ [], opts \\ []) do
     inputs = for p <- mod.ports, p.dir == :input, p.role not in [:clock, :reset], do: p.name
-    sim = Sim.new(mod, Keyword.take(opts, [:clocks]))
+
+    {impl, sim} =
+      case Keyword.get(opts, :engine, :beam) do
+        :beam -> {Sim, Sim.new(mod, Keyword.take(opts, [:clocks]))}
+        :verilator -> {Session, Session.open!(mod, Keyword.take(opts, [:clocks, :cache_dir]))}
+      end
 
     %__MODULE__{
+      impl: impl,
       module: mod,
       sim: sim,
-      outputs: Sim.outputs(sim),
+      outputs: impl.outputs(sim),
       inputs: MapSet.new(inputs),
       idle: Map.new(Keyword.get(opts, :idle, %{})),
       agents: agents
@@ -45,7 +57,11 @@ defmodule ExPcie.Model.Bench do
   def output(%__MODULE__{outputs: o}, name), do: Map.fetch!(o, name)
 
   @doc "Value of a signal after the last clock edge."
-  def peek(%__MODULE__{sim: s}, name), do: Sim.peek(s, name)
+  def peek(%__MODULE__{impl: i, sim: s}, name), do: i.peek(s, name)
+
+  @doc "Stops the Verilator process of an `engine: :verilator` bench (no-op for the BEAM simulator)."
+  def close(%__MODULE__{impl: Session, sim: s}), do: Session.close(s)
+  def close(%__MODULE__{}), do: :ok
 
   @doc "Current simulator (state after the last clock edge)."
   def sim(%__MODULE__{sim: s}), do: s
@@ -81,8 +97,8 @@ defmodule ExPcie.Model.Bench do
   end
 
   defp step(b, ins, agents) do
-    sim = Sim.poke(b.sim, ins)
-    outs = Sim.outputs(sim)
+    sim = b.impl.poke(b.sim, ins)
+    outs = b.impl.outputs(sim)
 
     agents =
       if b.cycle < 2,
@@ -91,7 +107,7 @@ defmodule ExPcie.Model.Bench do
 
     %{
       b
-      | sim: Sim.step(sim),
+      | sim: b.impl.step(sim),
         agents: agents,
         cycle: b.cycle + 1,
         trace: [ins | b.trace],
@@ -103,6 +119,6 @@ defmodule ExPcie.Model.Bench do
   def stimulus(%__MODULE__{trace: t}), do: Enum.reverse(t)
 
   @doc "Replays the recorded stimulus in Verilator; `:ok` or the first mismatch."
-  def compare_verilator(%__MODULE__{} = b, opts \\ []),
+  def compare_verilator(%__MODULE__{impl: Sim} = b, opts \\ []),
     do: Cosim.compare(b.module, stimulus(b), opts)
 end

@@ -163,4 +163,58 @@ defmodule ExPcie.Test.Tops do
       err <~ h.err_count
     end
   end
+
+  @doc "A `DescRing` behind an `RqMux` (the other input is tied off); the engine side is on ports of the same names."
+  def desc_ring(opts \\ []) do
+    module "desc_ring_top" do
+      rq = master(:rq, Ifc.rq())
+      rc = slave(:rc, Ifc.rc())
+      r = instance(:r, ExPcie.RTL.DescRing.build(opts))
+      m = instance(:m, ExPcie.RTL.RqMux.build_n(2))
+      rc.tready <~ 1
+      r.rc_tdata <~ rc.tdata
+      r.rc_tvalid <~ rc.tvalid
+      r.rc_tlast <~ rc.tlast
+      connect(r.rq, m.s0)
+      connect(m.rq, rq)
+      for f <- [:tdata, :tkeep, :tlast, :tuser, :tvalid], do: m.s1[f] <~ 0
+      output(:unused_s1_tready, 1) <~ m.s1.tready
+      r.done <~ m.done[0]
+      output(:unused_done1, 1) <~ m.done[1]
+
+      for {n, w} <- [
+            run: 1,
+            dbase: 64,
+            dsize: 16,
+            head: 16,
+            wb_addr: 64,
+            wb_desc: 1,
+            wb_head: 1,
+            irq_en: 1,
+            timeout_cycles: 24,
+            d_next: 1,
+            cmp_valid: 1,
+            cmp_len: 32,
+            cmp_err: 1,
+            cmp_eop: 1,
+            cmp_irq: 1
+          ],
+          do: r[n] <~ input(n, w)
+
+      for {n, w} <- [
+            d_valid: 1,
+            d_addr: 64,
+            d_len: 32,
+            d_irq: 1,
+            d_stop: 1,
+            cmp_busy: 1,
+            irq: 1,
+            tail: 16,
+            count: 32,
+            fetch: 16,
+            stat: 3
+          ],
+          do: output(n, w) <~ r[n]
+    end
+  end
 end

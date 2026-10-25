@@ -2,7 +2,7 @@ defmodule ExPcie.RTL.SynthTest do
   use ExUnit.Case, async: true
 
   alias ExHdl.Backends.SystemVerilog.RTL, as: SV
-  alias ExPcie.RTL.{Bar0Bridge, C2h, Dma, Endpoint, H2c, IrqCtrl, RqMux}
+  alias ExPcie.RTL.{Bar0Bridge, C2h, DescRing, Dma, Endpoint, H2c, IrqCtrl, RqMux}
 
   defp modules do
     [
@@ -10,6 +10,11 @@ defmodule ExPcie.RTL.SynthTest do
       C2h.build(),
       H2c.build(),
       RqMux.build(),
+      RqMux.build_n(4),
+      H2c.build(desc: true, timeout: :input),
+      C2h.build(desc: true),
+      DescRing.build(),
+      DescRing.build(channel: 1, stop: false),
       IrqCtrl.build(vectors: 4),
       Dma.build(),
       Endpoint.build(),

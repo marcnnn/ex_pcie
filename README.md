@@ -15,10 +15,10 @@ Alibaba AS02MC04 (XCKU3P) where DMA latency matters more than bandwidth.
 | Interrupts (MSI-X table in BAR0, MSI) | done |
 | Host side (`ExPcie.Device`: mock, sysfs, vfio NIF; `ExPcie.Host`) | done; mock and sysfs tested here, vfio ioctl paths compiled but never run (no card, no IOMMU device on the dev machine) |
 | Hard block black box (PCIE4C) and top level, constraints | not here: ex_hdl_xilinx |
-| Descriptor rings in host memory (scatter-gather) | not done; contiguous rings only, see Limits |
+| Descriptor rings in host memory (scatter-gather), both channels, write-back, interrupts | done, next to the simple rings; BEAM simulation with the driver model, Verilator replay and closed loop |
 | On hardware | nothing has run on a card |
 
-`mix test` runs 71 tests and 4 properties (about 100 s): codecs, register file, bridge,
+`mix test` runs 98 tests and 4 properties (about 110 s): codecs, register file, bridge,
 both channels, endpoint, host stack against the simulated card, Verilator
 lint and replay, a Yosys synthesis. Tests tagged `:verilator`, `:yosys`,
 `:nif` skip themselves when the tool or the NIF is missing.
@@ -46,15 +46,19 @@ lint and replay, a Yosys synthesis. Tests tagged `:verilator`, `:yosys`,
 | `ExPcie.RTL.Ifc` | the four streams as ExHdl interfaces |
 | `ExPcie.RTL.Bar0Bridge` | completer: 1 to 4 DWord MMIO reads and writes, completions, UR and CA handling |
 | `ExPcie.Regs` | the BAR0 register map as an `ExHdl.Regs` map: AXI4-Lite slave, host offsets and encode/decode, C header, Markdown |
-| `ExPcie.RTL.H2c`, `C2h` | the DMA channels |
-| `ExPcie.RTL.RqMux` | packet arbiter for the single RQ stream (wraps `ExHdlCores.AXIS.packet_mux/2`) |
+| `ExPcie.RTL.H2c`, `C2h` | the DMA channels (simple ring or descriptor mode) |
+| `ExPcie.RTL.DescRing` | descriptor fetch and write-back of one channel, see `ExPcie.DRing` for the format |
+| `ExPcie.DRing` | descriptor format, flags, write-back layout |
+| `ExPcie.RTL.RqMux` | packet arbiter for the single RQ stream (wraps `ExHdlCores.AXIS.packet_mux/2`; `build_n/1` for the four producers of `Dma`) |
 | `ExPcie.RTL.IrqCtrl` | MSI-X (table in BAR0) and MSI requests, retry on failure |
 | `ExPcie.RTL.Dma`, `Endpoint` | both channels with the mux; the whole endpoint (`loopback: true` loops the user streams for self-test; `extra:` adds register slaves behind the BAR) |
 | `ExPcie.Model.Core` | BEAM model of the hard block and the host (memory, completer, requester, interrupts) |
-| `ExPcie.Model.Bench`, `Agent`, `Stream`, `Pins` | closed-loop bench around `ExHdl.RTL.Sim`, records the stimulus for Verilator |
+| `ExPcie.Model.Bench`, `Agent`, `Stream`, `Pins` | closed-loop bench around `ExHdl.RTL.Sim` (or a Verilator session with `engine: :verilator`), records the stimulus for Verilator |
+| `ExPcie.Model.Driver` | host driver model for the descriptor rings: builds rings and buffers in the model's host memory, rings doorbells, reaps completions |
 | `ExPcie.Dma.Ref` | timing-free reference: TLP segmentation, ring contents, read requests |
 | `ExPcie.Device` (`Mock`, `Sysfs`, `Vfio`), `ExPcie.Nif` | host access |
-| `ExPcie.Host` | driver for the endpoint's register map (offsets from `ExPcie.Regs`), rings, pointers, interrupts |
+| `ExPcie.Host` | driver for the endpoint's register map (offsets from `ExPcie.Regs`), simple rings, pointers, interrupts |
+| `ExPcie.Host.Ring` | one descriptor ring on an `ExPcie.Device`: post, doorbell, reap |
 | `ExPcie.Sim.Card` | the endpoint RTL in the simulator behind a mock `ExPcie.Device` |
 
 ### DMA channels
@@ -83,8 +87,48 @@ pointer registers and the period interrupts.
   top. Periods are free: the audio period (1 ms or 64 frames) is just
   `period_bytes`, and `tlast` flushes sub-period TLPs.
 * Resources (Yosys, `synth_xilinx -family xcup`, whole endpoint): about
-  3.8k LUT, 3.9k FF, 77 LUTRAM cells, no BRAM or DSP (`C2h.build(style:
+  5.8k LUT, 6.3k FF (3.8k and 3.9k before the descriptor rings), 77 LUTRAM
+  cells, no BRAM or DSP (`C2h.build(style:
   :block)` uses 8 RAMB18 instead of LUTRAM).
+
+### Descriptor rings
+
+Each channel can use a descriptor ring in host memory instead of the
+simple ring (`ctrl.h2c_desc` / `ctrl.c2h_desc`, set together with the run
+bit; the simple registers are ignored then). The format and the rules are
+in `ExPcie.DRing`; in short:
+
+* 32-byte descriptors, `dsize` entries at `dbase`: DWords 0-1 buffer
+  address, 2 length (multiple of 32), 3 flags (`irq`, `stop`), 4-5 free
+  for software, 6 status and 7 bytes transferred written by the card.
+* The host posts descriptors and writes the producer index to
+  `<ch>_dhead` (the doorbell). The card fetches one descriptor ahead with
+  a 32-byte memory read, completes them in order and, as `dctrl` says,
+  writes DWords 6-7 of the descriptor (`wb_desc`) and an 8-byte head block
+  at `wb` (`wb_head`: tail index, completed count), then raises the
+  channel interrupt (vector 0 H2C, 1 C2H) if the descriptor had the `irq`
+  flag and `irq_en` is set. The interrupt follows the write-back.
+* H2C streams each buffer out (no `tlast`). C2H fills each buffer from the
+  stream and completes it when it is full, or with the `stop` flag at the
+  end of a stream packet (`eop` status, byte count in DWord 7); without a
+  buffer the stream is back-pressured. A failed or timed out data read
+  sets `error` in the H2C descriptor and the stream goes on.
+* A misaligned or empty descriptor, a failed descriptor read or one that
+  times out (same `timeout` register) halts the ring: `dstat` shows it,
+  clearing the run bit restarts at index 0.
+
+```elixir
+{:ok, ring} = ExPcie.Host.Ring.open(dev, :c2h, entries: 64, irq: true)
+:ok = ExPcie.Host.Ring.start(ring)
+{:ok, ring} = ExPcie.Host.Ring.post(ring, rx_buf, 0, 4096, [:irq])
+:ok = ExPcie.Host.Ring.doorbell(ring)
+{:ok, ring, done} = ExPcie.Host.Ring.reap(ring)
+```
+
+`ExPcie.Model.Driver` does the same against the model's host memory for the
+bench tests (`test/rtl/dring_endpoint_test.exs`). Cost of the rings:
+see the resource line above (the two ring units, the per-TLP address
+queue of C2H and the fourth RQ port cost about 2k LUT).
 
 ### BAR0 map and more register slaves
 
@@ -197,14 +241,16 @@ agrees with the core.
 
 ## Limits
 
-* Rings are contiguous; no descriptor rings or scatter-gather. `base`,
-  `ring`, `period` multiples of 32 bytes, `ring` a multiple of `period`.
+* Simple rings are contiguous; `base`, `ring`, `period` multiples of 32
+  bytes, `ring` a multiple of `period`. Descriptor rings (below) give
+  scatter-gather: address and length of each buffer multiples of 32 bytes.
 * C2H packets are whole 32-byte beats; one write TLP in flight.
 * H2C requests are at most 256 bytes, at most eight outstanding; after
   clearing `run`, completions still in flight are ignored through the tag
   generation, not waited for.
 * H2C completion timeout: the oldest outstanding read gives up after
-  `H2c.build(timeout: cycles)` (default 50_000, 200 us) without progress;
+  the `timeout` register (24-bit cycles, reset 50_000 = 200 us, 0 disables;
+  `H2c.build(timeout: cycles)` fixes it at build time) without progress;
   its bytes in the stream are then undefined and `h2c_err` counts it.
   Only the head slot is timed, so a lost read behind it times out once it
   becomes the head. C2H writes are posted and have no timeout.

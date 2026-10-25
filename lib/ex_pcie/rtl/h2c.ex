@@ -33,7 +33,9 @@ defmodule ExPcie.RTL.H2c do
   the slot holds so the stream does not stall).
 
   Completion timeout: option `timeout:` (cycles, default 50_000 = 200 us at
-  250 MHz, inside the PCIe range of 50 us to 50 ms; `nil` disables). When
+  250 MHz, inside the PCIe range of 50 us to 50 ms; `nil` disables;
+  `:input` adds the 24-bit port `timeout_cycles` instead, 0 disables, which
+  `ExPcie.RTL.Dma` connects to the `timeout` register). When
   the oldest outstanding request (the slot that blocks the stream) has
   made no progress for that long, it is completed with whatever its slot
   holds and counted in `err_count`. A per-slot epoch bit in the tag
@@ -41,6 +43,18 @@ defmodule ExPcie.RTL.H2c do
   request timed out is dropped instead of landing in the next request of
   that slot (it is only accepted again if the slot was reallocated an
   even number of times in between).
+
+  Descriptor mode (option `desc: true`, selected at run time by the
+  `desc_mode` input): instead of looping over the ring, the channel takes
+  segments (`d_valid`, `d_addr`, `d_len`, `d_irq`; `d_next` pops one) from an
+  `ExPcie.RTL.DescRing`, requests them like the ring (a request never
+  crosses the end of a segment), marks the last slot of each segment and,
+  when the last beat of a segment was delivered to the stream, reports
+  it on `cmp_valid` with `cmp_len`, `cmp_err` (a request of the segment
+  failed or timed out) and `cmp_irq`. A segment is 32-byte aligned and a
+  multiple of 32 bytes. The period interrupt and `ptr` are not used in
+  this mode. Descriptor fetch completions (tag bit 7 set) are ignored here
+  and not counted as errors.
   """
   use ExHdl.RTL
   alias ExPcie.RTL.{Ifc, Util}
@@ -50,9 +64,19 @@ defmodule ExPcie.RTL.H2c do
 
   def build(opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 50_000)
-    tw = if timeout, do: max(1, Integer.digits(timeout, 2) |> length()), else: 1
+    with_desc = Keyword.get(opts, :desc, false)
 
-    module "pcie_h2c" do
+    tw =
+      cond do
+        timeout == :input -> 24
+        timeout -> max(1, Integer.digits(timeout, 2) |> length())
+        true -> 1
+      end
+
+    name =
+      "pcie_h2c#{if with_desc, do: "_desc", else: ""}#{if timeout == :input, do: "_ti", else: ""}"
+
+    module name do
       m = master(:m_axis, Interface.axi_stream(data: 256, keep: false, last: false))
       rq = master(:rq, Ifc.rq())
       rc = slave(:rc, Ifc.rc())
@@ -64,6 +88,16 @@ defmodule ExPcie.RTL.H2c do
       ptr_o = output(:ptr, 32)
       irq_o = output(:irq, 1)
       err_o = output(:err_count, 16)
+      tmo_in = if timeout == :input, do: input(:timeout_cycles, 24)
+
+      # descriptor mode (`desc: true`): segments come from an `ExPcie.RTL.DescRing`
+      {desc_mode, d_valid, d_addr, d_len, d_irq, cmp_busy} =
+        if with_desc do
+          {input(:desc_mode, 1), input(:d_valid, 1), input(:d_addr, 64), input(:d_len, 32),
+           input(:d_irq, 1), input(:cmp_busy, 1)}
+        else
+          {const(0, 1), const(0, 1), const(0, 64), const(0, 32), const(0, 1), const(0, 1)}
+        end
 
       run_q = reg(:run_q, 1)
       gen = reg(:gen, 3)
@@ -82,6 +116,12 @@ defmodule ExPcie.RTL.H2c do
       s_got = for i <- 0..(@slots - 1), do: reg(:"s_got#{i}", 7)
       s_busy = for i <- 0..(@slots - 1), do: reg(:"s_busy#{i}", 1)
       s_ep = for i <- 0..(@slots - 1), do: reg(:"s_ep#{i}", 1)
+      s_last = for i <- 0..(@slots - 1), do: reg(:"s_last#{i}", 1)
+      s_irq = for i <- 0..(@slots - 1), do: reg(:"s_irq#{i}", 1)
+      s_err = for i <- 0..(@slots - 1), do: reg(:"s_err#{i}", 1)
+      seg_valid = reg(:seg_valid, 1)
+      seg_len = reg(:seg_len, 32)
+      seg_irq = reg(:seg_irq, 1)
       release = wire(:slot_rel, 1)
       err_count = reg(:err_count_r, 16)
 
@@ -93,15 +133,20 @@ defmodule ExPcie.RTL.H2c do
 
       blk = wire(:blk, req_addr[5..11])
       to4k = wire(:to4k, sub_wrap(const(128, 8), zext(blk, 8)))
-      to_ring = wire(:to_ring, sub_wrap(ring, req_off)[5..31])
+      lim = wire(:lim, mux(desc_mode, seg_len, ring))
+      to_ring = wire(:to_ring, sub_wrap(lim, req_off)[5..31])
       lim_mrrs = wire(:lim_mrrs, mux(mrrs == 0, const(4, 8), const(@rows, 8)))
       b1 = wire(:b1, mux(lim_mrrs < to4k, lim_mrrs, to4k))
       rb = wire(:rb, mux(to_ring > @rows, const(@rows, 4), trunc(to_ring, 4)))
       beats = wire(:beats, trunc(mux(zext(rb, 8) < b1, zext(rb, 8), b1), 4))
       bytes = wire(:bytes, cat([beats, const(0, 5)]))
       new_off = wire(:new_off, add_wrap(req_off, zext(bytes, 32)))
-      wrap = wire(:wrap, new_off == ring)
-      alloc = wire(:alloc, active and count < @slots and not rq_v)
+      wrap = wire(:wrap, new_off == lim)
+
+      alloc =
+        wire(:alloc, active and count < @slots and not rq_v and (not desc_mode or seg_valid))
+
+      load = wire(:load, active and desc_mode and d_valid and not seg_valid)
       new_ep = wire(:new_ep, not mux(atail, s_ep))
 
       desc =
@@ -145,6 +190,8 @@ defmodule ExPcie.RTL.H2c do
       len0 = wire(:len0, mux(tag0, s_len))
       start0 = wire(:start0, trunc(sub_wrap(zext(len0, 11), bc0), 7))
       pos0 = wire(:pos0, add_wrap(cat([tag0, const(0, 6)]), zext(start0, 9)))
+
+      foreign0 = wire(:foreign0, r0d[71])
 
       cur_tag = reg(:cur_tag, 3)
       cur_dwc = reg(:cur_dwc, 11)
@@ -196,7 +243,13 @@ defmodule ExPcie.RTL.H2c do
           tmo = reg(:tmo, tw)
           waiting = wire(:tmo_wait, active and count > 0 and not head_ready)
           progress = wire(:tmo_prog, upd and tag_e == head)
-          hit = wire(:tmo_hit, waiting and not progress and tmo == timeout - 1)
+
+          limit =
+            if timeout == :input,
+              do: tmo_in != 0 and add_wrap(tmo, 1) == tmo_in,
+              else: tmo == timeout - 1
+
+          hit = wire(:tmo_hit, waiting and not progress and limit)
 
           sync do
             tmo <~ mux(waiting and not progress and not hit, add_wrap(tmo, 1), const(0, tw))
@@ -207,8 +260,26 @@ defmodule ExPcie.RTL.H2c do
           wire(:tmo_hit, const(0, 1))
         end
 
-      advance = wire(:advance, active and head_ready and (not ov or m.tready))
       last_row = wire(:last_row, orow + 1 == orows)
+      last_slot = wire(:last_slot, mux(head, s_last))
+      fin_row = wire(:fin_row, desc_mode and last_row and last_slot)
+      ov_last = reg(:ov_last, 1)
+      ov_irq = reg(:ov_irq, 1)
+      ov_err = reg(:ov_err, 1)
+      ov_len = reg(:ov_len, 32)
+      acc_len = reg(:acc_len, 32)
+      acc_err = reg(:acc_err, 1)
+      slot_dw = wire(:slot_dw, mux(head, s_len))
+      slot_bytes = wire(:slot_bytes, zext(cat([slot_dw, const(0, 2)]), 32))
+      slot_err = wire(:slot_err, mux(head, s_err))
+
+      advance =
+        wire(
+          :advance,
+          active and head_ready and (not ov or m.tready) and
+            (not fin_row or (not cmp_busy and not ov_last))
+        )
+
       release <~ (advance and last_row)
       deliv = wire(:deliv, ov and m.tready)
       raddr = wire(:raddr, cat([head, orow[0..2]]))
@@ -230,14 +301,19 @@ defmodule ExPcie.RTL.H2c do
           req_off <~ mux(wrap, const(0, 32), new_off)
           req_addr <~ mux(wrap, base, add_wrap(req_addr, zext(bytes, 64)))
           atail <~ add_wrap(atail, 1)
+          if desc_mode and wrap, do: seg_valid <~ 0
         else
           if rq.tready, do: rq_v <~ 0
         end
 
         for i <- 0..(@slots - 1) do
           if upd and tag_e == i, do: Enum.at(s_got, i) <~ new_got
+          if upd and tag_e == i and bad_e, do: Enum.at(s_err, i) <~ 1
 
           if alloc and atail == i do
+            Enum.at(s_last, i) <~ (desc_mode and wrap)
+            Enum.at(s_irq, i) <~ seg_irq
+            Enum.at(s_err, i) <~ 0
             Enum.at(s_ep, i) <~ new_ep
             Enum.at(s_len, i) <~ cat([beats, const(0, 3)])
             Enum.at(s_got, i) <~ 0
@@ -251,6 +327,15 @@ defmodule ExPcie.RTL.H2c do
 
         for i <- 0..(@slots - 1) do
           if tmo_hit and head == i, do: Enum.at(s_got, i) <~ Enum.at(s_len, i)
+          if tmo_hit and head == i, do: Enum.at(s_err, i) <~ 1
+        end
+
+        if load do
+          req_addr <~ d_addr
+          req_off <~ 0
+          seg_len <~ d_len
+          seg_irq <~ d_irq
+          seg_valid <~ 1
         end
 
         if r0v do
@@ -260,7 +345,7 @@ defmodule ExPcie.RTL.H2c do
           cur_bad <~ bad_e
           cur_pos <~ add_wrap(pos_e, mux(r0f, const(5, 10), const(8, 10)))
 
-          if r0f and active and (bad0 or not ok0) and not stale0,
+          if r0f and active and (bad0 or not ok0) and not stale0 and not foreign0,
             do: err_count <~ add_wrap(err_count, 1)
         end
 
@@ -269,13 +354,28 @@ defmodule ExPcie.RTL.H2c do
 
         if advance do
           ov <~ 1
+          ov_last <~ fin_row
           orow <~ mux(last_row, const(0, 4), add_wrap(orow, 1))
-          if last_row, do: head <~ add_wrap(head, 1)
+
+          if last_row do
+            head <~ add_wrap(head, 1)
+            acc_len <~ mux(last_slot, const(0, 32), add_wrap(acc_len, slot_bytes))
+            acc_err <~ mux(last_slot, const(0, 1), acc_err or slot_err)
+          end
+
+          if fin_row do
+            ov_len <~ add_wrap(acc_len, slot_bytes)
+            ov_err <~ (acc_err or slot_err)
+            ov_irq <~ mux(head, s_irq)
+          end
         else
-          if m.tready, do: ov <~ 0
+          if m.tready do
+            ov <~ 0
+            ov_last <~ 0
+          end
         end
 
-        irq <~ (deliv and out_pleft == 32)
+        irq <~ (deliv and out_pleft == 32 and not desc_mode)
 
         if deliv do
           out_off <~ mux(add_wrap(out_off, 32) == ring, const(0, 32), add_wrap(out_off, 32))
@@ -288,6 +388,10 @@ defmodule ExPcie.RTL.H2c do
           atail <~ 0
           req_off <~ 0
           req_addr <~ base
+          seg_valid <~ 0
+          acc_len <~ 0
+          acc_err <~ 0
+          ov_last <~ 0
           rq_v <~ 0
           orow <~ 0
           ov <~ 0
@@ -300,6 +404,15 @@ defmodule ExPcie.RTL.H2c do
       ptr_o <~ out_off
       irq_o <~ irq
       err_o <~ err_count
+
+      if with_desc do
+        output(:d_next, 1) <~ load
+        output(:cmp_valid, 1) <~ (ov and m.tready and ov_last)
+        output(:cmp_len, 32) <~ ov_len
+        output(:cmp_err, 1) <~ ov_err
+        output(:cmp_irq, 1) <~ ov_irq
+        output(:cmp_eop, 1) <~ 0
+      end
     end
   end
 end

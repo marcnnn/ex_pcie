@@ -1,7 +1,8 @@
 defmodule ExPcie.HostTest do
   use ExUnit.Case, async: true
 
-  alias ExPcie.{Device, Host}
+  alias ExPcie.{Device, DRing, Host}
+  alias ExPcie.Host.Ring
   alias ExPcie.Model.Core
   alias ExPcie.Sim.Card
 
@@ -70,6 +71,60 @@ defmodule ExPcie.HostTest do
       assert Host.ptr(dev, :c2h) == 0
       assert Host.h2c_errors(dev) == 0
       assert Core.errors(Card.core(card)) == []
+    end
+
+    test "descriptor rings: loopback with write-back and interrupts", %{dev: dev, card: card} do
+      :rand.seed(:exsss, {4, 5, 6})
+      {:ok, tx} = Device.alloc_dma(dev, 8192)
+      {:ok, rx} = Device.alloc_dma(dev, 8192)
+      data = :rand.bytes(4096)
+      :ok = Device.dma_write(dev, tx, 0, data)
+
+      assert %{desc: 1} = Host.fields(dev, :caps)
+      {:ok, h2c} = Ring.open(dev, :h2c, entries: 8, irq: true)
+      {:ok, c2h} = Ring.open(dev, :c2h, entries: 8, wb: :desc, irq: true)
+
+      # four H2C descriptors of 1 KiB, the last one with an interrupt; C2H 2 KiB buffers
+      h2c =
+        Enum.reduce(0..3, h2c, fn i, r ->
+          {:ok, r} = Ring.post(r, tx, i * 1024, 1024, if(i == 3, do: [:irq], else: []), i)
+          r
+        end)
+
+      c2h =
+        Enum.reduce(0..1, c2h, fn i, r ->
+          {:ok, r} = Ring.post(r, rx, i * 2048, 2048, [:irq], 10 + i)
+          r
+        end)
+
+      :ok = Ring.start(c2h)
+      :ok = Ring.start(h2c)
+      :ok = Ring.doorbell(c2h)
+      :ok = Ring.doorbell(h2c)
+
+      for _ <- 1..60, do: Card.advance(card, 100)
+      assert :ok = Host.wait_irq(dev, 0, 0)
+      assert :ok = Host.wait_irq(dev, 1, 0)
+
+      assert Ring.head(h2c) == %{tail: 4, count: 4}
+      assert %{completed: 4, halted: false} = Ring.status(h2c)
+      {:ok, h2c, done} = Ring.reap(h2c)
+      assert Enum.map(done, & &1.bytes) == [1024, 1024, 1024, 1024]
+      assert Ring.space(h2c) == 7
+
+      {:ok, c2h, done} = Ring.reap(c2h)
+      assert Enum.map(done, &{&1.bytes, &1.cookie}) == [{2048, 10}, {2048, 11}]
+      assert {:ok, ^data} = Device.dma_read(dev, rx, 0, 4096)
+      assert Ring.space(c2h) == 7
+
+      # the ring restarts at index 0 after a stop
+      h2c = Ring.stop(h2c)
+      assert h2c.head == 0
+      Card.advance(card, 50)
+      assert %{tail: 0, completed: 0} = Ring.status(h2c)
+      assert {:error, :unaligned} = Ring.post(h2c, tx, 16, 64)
+      assert Core.errors(Card.core(card)) == []
+      assert DRing.size() == 32
     end
 
     test "software interrupt", %{dev: dev, card: card} do

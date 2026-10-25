@@ -74,6 +74,33 @@ option) so top levels need not invent ports.
   `value` that gives `h2c_ring_value`. Wish: an option that drops the
   field name for a register with one field.
 
+### 3a. `cat` of a `mux(sel, list)` fails in SystemVerilog generation
+
+```elixir
+use ExHdl.RTL
+
+m =
+  module "repro_cat_muxn" do
+    sel = input(:sel, 2)
+    y = output(:y, 8)
+    r = [reg(:r0, 4), reg(:r1, 4), reg(:r2, 4), reg(:r3, 4)]
+    sync do
+      for x <- r, do: x <~ add_wrap(x, 1)
+    end
+    y <~ cat([mux(sel, r), const(0, 4)])
+  end
+
+ExHdl.Backends.SystemVerilog.RTL.generate(m)
+```
+
+Raises `FunctionClauseError` in `String.length/1` with the argument
+`:_t1`: `ex/2` for a `:muxn` returns the fresh temporary name as an atom,
+and the `:cat` clause measures the strings of its items. The BEAM
+simulator accepts the design, so only Verilator, lint and Yosys runs hit
+it. Workaround in ex_pcie: `wire/2` around the `mux` before the `cat`
+(`H2c`, `slot_dw`). Fix: return `Atom.to_string(name)` (or
+`to_string/1` in the `cat` clause).
+
 ### 4. Closed-loop co-simulation
 
 `Cosim.compare/3` replays a recorded input trace. The bench in ex_pcie
@@ -83,7 +110,11 @@ Verilator; this works because the DUT is deterministic given its inputs,
 but a failing run cannot be diagnosed beyond "output X differs at event
 N". Wishes: a generic version of the agent loop in ExHdl (it has no
 PCIe knowledge: `drive/2`, `sample/3`, trace recording), and a way to
-dump the Verilator VCD for a replayed trace.
+dump the Verilator VCD for a replayed trace. Partly done on both sides:
+`ExHdl.RTL.Bench` runs against a `Cosim.Session`, and `ExPcie.Model.Bench`
+now takes `engine: :verilator` (agents against the netlist itself; the
+descriptor ring tests use it). Moving ex_pcie to `ExHdl.RTL.Bench` would
+need its `Agent` behaviour mapped onto `ExHdl.RTL.Bench.Agent`.
 
 ### 5. `Interface.axi_stream` `tkeep` granularity
 
@@ -108,6 +139,17 @@ distributed RAM (37 RAM cells), not block RAM. That is what `:auto` means
 for Vivado too, so no change is requested; `style: :block` gives 8 RAMB18
 (`C2h.build(style: :block)`). A note in the `memory/2` docs about the
 auto thresholds would help.
+
+### Descriptor rings (done; what they used)
+
+Four RQ producers need `AXIS.packet_mux(4, ...)` (`RqMux.build_n/1`), and
+the shared RC stream is fanned out by plain inputs on the extra consumers
+(`DescRing` has `rc_tdata`, `rc_tvalid`, `rc_tlast` and no `tready`), the
+workaround for item 2: a consumer that only listens has no unused output.
+For `DescRing` `stop: false` omits the `d_stop` port for the same reason.
+A wish that follows from it: `slave/2` interfaces whose `tready` is
+optional (a listener flag), so a second consumer of a stream is a normal
+`connect/2`.
 
 ## ex_hdl_xilinx
 

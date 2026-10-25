@@ -14,10 +14,13 @@ defmodule ExPcie.RTL.Endpoint do
 
   Declared in `ExPcie.Regs` (`defregs`-style map; the module has the table,
   `ExPcie.Regs.c_header/1` and `markdown/1` render it). Summary: `id` at
-  0x000, `caps` 0x004, `ctrl` 0x010 (bit 0 H2C run, bit 1 C2H run),
-  `status` 0x014 (w1c), the channel registers at 0x020 (H2C) and 0x040
-  (C2H), `irq_force` 0x060, counters up to 0x06C, the MSI-X table at
-  0x1000 + 16 i and the PBA at 0x2000.
+  0x000, `caps` 0x004, `ctrl` 0x010 (bit 0 H2C run, bit 1 C2H run, bit 2
+  and 3 descriptor mode of H2C and C2H), `timeout` 0x018 (H2C read
+  completion and descriptor fetch timeout), `status` 0x014 (w1c), the
+  channel registers at 0x020 (H2C) and 0x040 (C2H), `irq_force` 0x060,
+  counters up to 0x06C, the descriptor ring registers at 0x100 (H2C) and
+  0x140 (C2H, see `ExPcie.DRing`), the MSI-X table at 0x1000 + 16 i and
+  the PBA at 0x2000.
 
   ## More register slaves behind the same BAR
 
@@ -213,12 +216,31 @@ defmodule ExPcie.RTL.Endpoint do
 
       dma.h2c_run <~ rf.ctrl_h2c_run
       dma.c2h_run <~ rf.ctrl_c2h_run
+      dma.h2c_desc <~ rf.ctrl_h2c_desc
+      dma.c2h_desc <~ rf.ctrl_c2h_desc
+      dma.timeout_cycles <~ rf.timeout_cycles
 
       for ch <- [:h2c, :c2h] do
         dma[:"#{ch}_base"] <~ cat([rf[:"#{ch}_base_hi_value"], rf[:"#{ch}_base_lo_value"]])
         dma[:"#{ch}_ring_bytes"] <~ rf[:"#{ch}_ring_value"]
         dma[:"#{ch}_period_bytes"] <~ rf[:"#{ch}_period_value"]
         rf[:"#{ch}_ptr_value"] <~ dma[:"#{ch}_ptr"]
+
+        dma[:"#{ch}_dbase"]
+        <~ cat([rf[:"#{ch}_dbase_hi_value"], rf[:"#{ch}_dbase_lo_value"]])
+
+        dma[:"#{ch}_dsize"] <~ rf[:"#{ch}_dsize_value"]
+        dma[:"#{ch}_dhead"] <~ rf[:"#{ch}_dhead_value"]
+        dma[:"#{ch}_wb"] <~ cat([rf[:"#{ch}_wb_hi_value"], rf[:"#{ch}_wb_lo_value"]])
+        dma[:"#{ch}_wb_desc"] <~ rf[:"#{ch}_dctrl_wb_desc"]
+        dma[:"#{ch}_wb_head"] <~ rf[:"#{ch}_dctrl_wb_head"]
+        dma[:"#{ch}_irq_en"] <~ rf[:"#{ch}_dctrl_irq_en"]
+        rf[:"#{ch}_dtail_value"] <~ dma[:"#{ch}_dtail"]
+        rf[:"#{ch}_dcount_value"] <~ dma[:"#{ch}_dcount"]
+        rf[:"#{ch}_dfetch_value"] <~ dma[:"#{ch}_dfetch"]
+        rf[:"#{ch}_dstat_halted"] <~ dma[:"#{ch}_dstat"][0]
+        rf[:"#{ch}_dstat_bad_desc"] <~ dma[:"#{ch}_dstat"][1]
+        rf[:"#{ch}_dstat_fetch_error"] <~ dma[:"#{ch}_dstat"][2]
       end
 
       rf.h2c_err_value <~ zext(dma.h2c_err_count, 32)

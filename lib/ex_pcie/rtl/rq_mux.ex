@@ -31,4 +31,25 @@ defmodule ExPcie.RTL.RqMux do
       b_done <~ m.done[1]
     end
   end
+
+  @doc """
+  The same arbiter for `n` producers: slave streams `s0` ... `s<n-1>`,
+  `rq` (master), and `done` (`n` bits), bit `i` pulsing in the cycle the
+  last beat of a packet from producer `i` is transferred on `rq`. With
+  `n = 2` it is `build/0` with the ports renamed.
+  """
+  def build_n(n) when n >= 2 do
+    mux = AXIS.packet_mux(n, data: Ifc.dw(), keep_bits: div(Ifc.dw(), 32), user: 62, src: false)
+
+    module "pcie_rq_mux#{n}" do
+      ss = for i <- 0..(n - 1), do: slave(:"s#{i}", Ifc.rq())
+      rq = master(:rq, Ifc.rq())
+      done = output(:done, n)
+
+      m = instance(:m, mux)
+      for {s, i} <- Enum.with_index(ss), do: connect(s, m[:"s#{i}_axis"])
+      connect(m.m_axis, rq)
+      done <~ m.done
+    end
+  end
 end
