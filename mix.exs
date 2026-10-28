@@ -9,7 +9,8 @@ defmodule ExPcie.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       compilers: Mix.compilers() ++ [:ex_pcie_nif],
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      package: [licenses: ["Apache-2.0"]]
     ]
   end
 

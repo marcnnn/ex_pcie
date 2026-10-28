@@ -271,3 +271,7 @@ mix format --check-formatted && mix compile --warnings-as-errors
 ```
 
 Open questions for the sibling libraries are in `NEEDS.md`.
+
+## License
+
+Apache-2.0, see `LICENSE`.
