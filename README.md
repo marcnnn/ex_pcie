@@ -264,8 +264,10 @@ agrees with the core.
 
 ## Development
 
+Sibling libraries come from a checkout next to this one when there is one
+(`../exhdl` for ex_hdl, `../<name>` for the others), otherwise from GitHub.
+
 ```sh
-./scripts/checkout_siblings.sh   # path dependencies on ../exhdl and ../ex_hdl_cores
 mix test
 mix format --check-formatted && mix compile --warnings-as-errors
 ```

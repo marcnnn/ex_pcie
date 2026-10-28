@@ -23,9 +23,21 @@ defmodule ExPcie.MixProject do
 
   defp deps do
     [
-      {:ex_hdl, path: "../exhdl"},
-      {:ex_hdl_cores, path: "../ex_hdl_cores"},
+      sibling(:ex_hdl, path: "../exhdl"),
+      sibling(:ex_hdl_cores),
       {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]
+  end
+
+  # A sibling checkout (by default ../<app>) when there is one, otherwise the
+  # GitHub repository. Inside deps/ always GitHub, so that every project in a
+  # dependency tree picks the same source.
+  defp sibling(app, opts \\ []) do
+    {path, opts} = Keyword.pop(opts, :path, "../#{app}")
+    nested? = Path.basename(Path.dirname(__DIR__)) == "deps"
+
+    if not nested? and File.dir?(Path.expand(path, __DIR__)),
+      do: {app, [path: path, override: true] ++ opts},
+      else: {app, [github: "marcnnn/#{app}"] ++ opts}
   end
 end
