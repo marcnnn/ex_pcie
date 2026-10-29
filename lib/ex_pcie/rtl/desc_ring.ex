@@ -6,11 +6,12 @@ defmodule ExPcie.RTL.DescRing do
   The format is described in `ExPcie.DRing`.
 
   Option `stop: false` omits `d_stop` (the host-to-card engine has no use
-  for it); `channel:` (0 or 1) distinguishes the two units in the tags.
+  for it); `channel:` (0 to 7, `2 * pair` for H2C and
+  `2 * pair + 1` for C2H) distinguishes the units in the tags.
 
   Fetch: the host advances the producer index `head` (the doorbell
   register); while it differs from the fetch index the unit reads the next
-  32-byte descriptor with a memory read on RQ (tag bit 7 set, bit 0 the
+  32-byte descriptor with a memory read on RQ (tag bit 7 set, bits 2:0 the
   `channel:` option, bits 6:3 a generation that changes at every start),
   keeps one descriptor ahead of the engine and presents the oldest on
   `d_valid`, `d_addr`, `d_len`, `d_irq`, `d_stop`; `d_next` consumes it.
@@ -143,7 +144,7 @@ defmodule ExPcie.RTL.DescRing do
 
       # -- RC: stage 1, the two beats of a 32-byte completion (payload starts at DWord 3)
       mine =
-        wire(:mine, r0d[64..71] == cat([const(1, 1), gen, const(0, 2), const(ch, 1)]))
+        wire(:mine, r0d[64..71] == cat([const(1, 1), gen, const(ch, 3)]))
 
       cpl_bad =
         wire(
@@ -207,7 +208,7 @@ defmodule ExPcie.RTL.DescRing do
           address: fet_addr,
           dw_count: 8,
           req_type: :mem_read,
-          tag: cat([const(1, 1), gen, const(0, 2), const(ch, 1)])
+          tag: cat([const(1, 1), gen, const(ch, 3)])
         })
 
       abort = fn ->

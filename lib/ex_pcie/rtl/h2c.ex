@@ -13,8 +13,8 @@ defmodule ExPcie.RTL.H2c do
   Eight slots of 256 bytes sit between RC and the stream. A request owns a
   slot; its tag is the slot number plus a 3-bit generation that changes
   at every start (`run` rising), so completions still in flight from
-  before a stop are ignored instead of landing in a new request's slot. Completions are written into
-  the slot at the offset given by the descriptor's byte count, so they
+  before a stop are ignored instead of landing in a new request's slot.
+  Completions are written into the slot at the offset given by the descriptor's byte count, so they
   may arrive split at any RCB boundary, interleaved and reordered between
   requests (and even out of order within one). The output drains slots in
   request order, one 32-byte beat per cycle. Memory is eight 32-bit wide
@@ -22,11 +22,16 @@ defmodule ExPcie.RTL.H2c do
   cycle.
 
   Stream `m_axis`: `tdata` (256 bits), `tvalid`, `tready`; no `tlast`
-  (the ring is a continuous stream). The engine reads ahead as far as the
+  (the ring is a continuous stream), except with option `seg_last: true`:
+  the stream then has `tlast`, high on the last beat of each descriptor
+  segment in descriptor mode (never in simple ring mode). The engine reads ahead as far as the
   slots allow and keeps reading the ring in a loop whether or not the
   consumer keeps up.
 
-  Outputs: `rq` master (single-beat requests), `rc` slave, `ptr` (ring
+  Outputs: `rq` master (single-beat requests), `rc` slave (with option
+  `rc_shared: true` plain inputs `rc_tdata`, `rc_tkeep`, `rc_tlast`,
+  `rc_tvalid` instead, for a channel that listens to a stream another
+  consumer owns), `ptr` (ring
   offset in bytes delivered to the stream), `irq` (one-cycle pulse per
   delivered period), `err_count` (completions with error status, poison,
   or an unknown tag of the current generation, counted only while running; an errored request is completed with whatever data
@@ -55,6 +60,15 @@ defmodule ExPcie.RTL.H2c do
   multiple of 32 bytes. The period interrupt and `ptr` are not used in
   this mode. Descriptor fetch completions (tag bit 7 set) are ignored here
   and not counted as errors.
+
+  Tag layout (8 bits, LSB first): slot (3), generation (`3 - k`), pair
+  number (`k`), epoch (1), 0, where `k = clog2(pairs)` for the options
+  `pair:` (this channel's pair, default 0) and `pairs:` (pairs in the
+  design, default 1, at most 4). With one pair that is the layout above
+  with a 3-bit generation; with 2 pairs the generation has 2 bits, with 3
+  or 4 pairs 1 bit. Completions of another pair's data tag (same bit 7
+  clear, different pair field) are not this channel's and are neither
+  counted nor used; `ExPcie.RTL.Dma` has the whole partition.
   """
   use ExHdl.RTL
   alias ExPcie.RTL.{Ifc, Util}
@@ -65,6 +79,14 @@ defmodule ExPcie.RTL.H2c do
   def build(opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 50_000)
     with_desc = Keyword.get(opts, :desc, false)
+    seg_last = Keyword.get(opts, :seg_last, false)
+    rc_shared = Keyword.get(opts, :rc_shared, false)
+    pair = Keyword.get(opts, :pair, 0)
+    pairs = Keyword.get(opts, :pairs, 1)
+    pb = ExHdl.RTL.Builder.ceil_log2(pairs)
+    gb = 3 - pb
+    if pairs > 4 or pair >= pairs, do: raise(ArgumentError, "pairs must be 1..4, pair below it")
+    if seg_last and not with_desc, do: raise(ArgumentError, "seg_last needs desc: true")
 
     tw =
       cond do
@@ -74,12 +96,13 @@ defmodule ExPcie.RTL.H2c do
       end
 
     name =
-      "pcie_h2c#{if with_desc, do: "_desc", else: ""}#{if timeout == :input, do: "_ti", else: ""}"
+      "pcie_h2c#{if with_desc, do: "_desc", else: ""}#{if timeout == :input, do: "_ti", else: ""}" <>
+        "#{if seg_last, do: "_sl", else: ""}#{if rc_shared, do: "_rcin", else: ""}#{if pairs > 1, do: "_p#{pair}of#{pairs}", else: ""}"
 
     module name do
-      m = master(:m_axis, Interface.axi_stream(data: 256, keep: false, last: false))
+      m = master(:m_axis, Interface.axi_stream(data: 256, keep: false, last: seg_last))
       rq = master(:rq, Ifc.rq())
-      rc = slave(:rc, Ifc.rc())
+      rc = unless rc_shared, do: slave(:rc, Ifc.rc())
       run_in = input(:run, 1)
       base = input(:base, 64)
       ring = input(:ring_bytes, 32)
@@ -100,7 +123,7 @@ defmodule ExPcie.RTL.H2c do
         end
 
       run_q = reg(:run_q, 1)
-      gen = reg(:gen, 3)
+      gen = reg(:gen, gb)
       active = wire(:active, run_in and run_q)
 
       sync do
@@ -149,12 +172,14 @@ defmodule ExPcie.RTL.H2c do
       load = wire(:load, active and desc_mode and d_valid and not seg_valid)
       new_ep = wire(:new_ep, not mux(atail, s_ep))
 
+      pair_bits = if pb == 0, do: [], else: [const(pair, pb)]
+
       desc =
         Util.desc(:rq, %{
           address: req_addr,
           dw_count: cat([beats, const(0, 3)]),
           req_type: :mem_read,
-          tag: cat([const(0, 1), new_ep, gen, atail])
+          tag: cat([const(0, 1), new_ep] ++ pair_bits ++ [gen, atail])
         })
 
       # -- completion stage 0: register the beat
@@ -164,25 +189,39 @@ defmodule ExPcie.RTL.H2c do
       r0l = reg(:r0l, 1)
       r0f = reg(:r0f, 1)
       in_pkt = reg(:in_pkt, 1)
-      rc.tready <~ 1
+
+      {rc_data, rc_keep, rc_last, rc_valid} =
+        if rc_shared do
+          {input(:rc_tdata, 256), input(:rc_tkeep, 8), input(:rc_tlast, 1), input(:rc_tvalid, 1)}
+        else
+          rc.tready <~ 1
+          {rc.tdata, rc.tkeep, rc.tlast, rc.tvalid}
+        end
 
       sync do
-        r0v <~ rc.tvalid
+        r0v <~ rc_valid
 
-        if rc.tvalid do
-          r0d <~ rc.tdata
-          r0k <~ rc.tkeep
-          r0l <~ rc.tlast
+        if rc_valid do
+          r0d <~ rc_data
+          r0k <~ rc_keep
+          r0l <~ rc_last
           r0f <~ not in_pkt
-          in_pkt <~ not rc.tlast
+          in_pkt <~ not rc_last
         end
       end
 
       # -- completion stage 1: decode, place, account
       tag0 = wire(:tag0, r0d[64..66])
       ep_ok0 = wire(:ep_ok0, r0d[70] == mux(r0d[64..66], s_ep))
-      tag_ok0 = wire(:tag_ok0, r0d[67..69] == gen and ep_ok0 and r0d[71] == 0)
-      stale0 = wire(:stale0, (r0d[67..69] != gen or not ep_ok0) and r0d[71] == 0)
+
+      mine0 =
+        wire(
+          :mine0,
+          if(pb == 0, do: r0d[71] == 0, else: r0d[71] == 0 and r0d[(67 + gb)..69] == pair)
+        )
+
+      tag_ok0 = wire(:tag_ok0, r0d[67..(66 + gb)] == gen and ep_ok0 and mine0)
+      stale0 = wire(:stale0, (r0d[67..(66 + gb)] != gen or not ep_ok0) and mine0)
       bc0 = wire(:bc0, r0d[18..28])
       dwc0 = wire(:dwc0, r0d[32..42])
       bad0 = wire(:bad0, r0d[43..45] != 0 or r0d[46] or r0d[12..15] != 0)
@@ -191,7 +230,7 @@ defmodule ExPcie.RTL.H2c do
       start0 = wire(:start0, trunc(sub_wrap(zext(len0, 11), bc0), 7))
       pos0 = wire(:pos0, add_wrap(cat([tag0, const(0, 6)]), zext(start0, 9)))
 
-      foreign0 = wire(:foreign0, r0d[71])
+      foreign0 = wire(:foreign0, not mine0)
 
       cur_tag = reg(:cur_tag, 3)
       cur_dwc = reg(:cur_dwc, 11)
@@ -287,6 +326,7 @@ defmodule ExPcie.RTL.H2c do
       rd = for b <- 0..7, do: read_port(Enum.at(banks, b), addr: raddr, en: advance)
       m.tdata <~ cat(Enum.reverse(rd))
       m.tvalid <~ ov
+      if seg_last, do: m.tlast <~ ov_last
 
       rq.tdata <~ rq_data
       rq.tkeep <~ 0x0F
