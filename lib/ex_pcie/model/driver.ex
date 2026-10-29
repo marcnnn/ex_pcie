@@ -18,8 +18,10 @@ defmodule ExPcie.Model.Driver do
 
   `setup/4` allocates the ring and the write-back block from a bump
   allocator (`arena:` option of `new/1`) and writes `dbase`, `dsize`,
-  `wb` and `dctrl`; `start/3` sets the `desc` and `run` bits of `ctrl`
-  (the bits of the other channel are kept). `post/6` writes a descriptor
+  `wb` and `dctrl`; `start/3` sets the `desc` and `run` bits of the
+  pair's `ctrl` register (the bits of the other channel are kept). The
+  channel atom (`:h2c`, `:c2h1`, ...) is the key of everything per ring,
+  so several pairs share one driver value. `post/6` writes a descriptor
   and advances the producer index without touching the doorbell, so a
   batch needs one `doorbell/3`. Ring space: at most `entries - 1`
   descriptors are outstanding.
@@ -29,7 +31,7 @@ defmodule ExPcie.Model.Driver do
   alias ExPcie.{DRing, Regs}
   alias ExPcie.Model.Core
 
-  defstruct next: 0x10_0000_0000, rings: %{}, ctrl: 0, tmo: nil
+  defstruct next: 0x10_0000_0000, rings: %{}, ctrl: %{}, tmo: nil
 
   @doc "New driver; `arena:` is the first host address of its allocator."
   def new(opts \\ []), do: %__MODULE__{next: Keyword.get(opts, :arena, 0x10_0000_0000)}
@@ -41,7 +43,8 @@ defmodule ExPcie.Model.Driver do
   end
 
   @doc """
-  Builds the ring of `ch` (`:h2c` or `:c2h`) and programs `dbase`, `dsize`,
+  Builds the ring of `ch` (`:h2c` or `:c2h`; for another channel pair
+  `ExPcie.Regs.channel/2`, e.g. `:c2h1`) and programs `dbase`, `dsize`,
   `wb` and `dctrl`. Options: `entries:` (8), `wb:` `:both` (default), `:desc`
   (status into the descriptors), `:head` (head block) or `:none`, `irq:`
   (`irq_en`, default false).
@@ -84,15 +87,16 @@ defmodule ExPcie.Model.Driver do
 
   @doc "Sets the `desc` and `run` bits of `ch` in `ctrl` (the other channel's bits are kept)."
   def start(%Core{} = core, %__MODULE__{} = d, ch) do
-    d = %{d | ctrl: d.ctrl ||| run_bit(ch) ||| desc_bit(ch)}
-    {w(core, :ctrl, d.ctrl), d}
+    {reg, v} = ctrl_update(d, ch, &(&1 ||| run_bit(ch) ||| desc_bit(ch)))
+    {w(core, reg, v), %{d | ctrl: Map.put(d.ctrl, reg, v)}}
   end
 
   @doc "Clears the run bit of `ch` (the card resets the ring); the driver's indices restart too."
   def stop(%Core{} = core, %__MODULE__{} = d, ch) do
-    d = %{d | ctrl: d.ctrl &&& ~~~run_bit(ch)}
+    {reg, v} = ctrl_update(d, ch, &(&1 &&& ~~~run_bit(ch)))
+    d = %{d | ctrl: Map.put(d.ctrl, reg, v)}
     ring = %{d.rings[ch] | head: 0, reaped: 0, posted: %{}}
-    {w(core, :ctrl, d.ctrl), %{d | rings: Map.put(d.rings, ch, ring)}}
+    {w(core, reg, v), %{d | rings: Map.put(d.rings, ch, ring)}}
   end
 
   @doc "Programs the completion timeout register (cycles)."
@@ -126,11 +130,14 @@ defmodule ExPcie.Model.Driver do
     end
   end
 
-  @doc "H2C: copies `data` into a new buffer and posts it. Returns `{core, drv, index}`."
-  def post_data(%Core{} = core, %__MODULE__{} = d, data, flags \\ [], cookie \\ 0) do
+  @doc """
+  H2C: copies `data` into a new buffer and posts it on `ch` (default
+  `:h2c`, pair 0). Returns `{core, drv, index}`.
+  """
+  def post_data(%Core{} = core, %__MODULE__{} = d, data, flags \\ [], cookie \\ 0, ch \\ :h2c) do
     {d, addr} = alloc(d, byte_size(data), 32)
     core = Core.put_mem(core, addr, data)
-    post(core, d, :h2c, addr, byte_size(data), flags, cookie)
+    post(core, d, ch, addr, byte_size(data), flags, cookie)
   end
 
   @doc "C2H: posts a new empty buffer of `len` bytes. Returns `{core, drv, index}`."
@@ -207,10 +214,13 @@ defmodule ExPcie.Model.Driver do
   def head_block(%Core{} = core, %__MODULE__{} = d, ch),
     do: DRing.decode_head(Core.read_mem(core, Map.fetch!(d.rings, ch).wb, 8))
 
-  defp run_bit(:h2c), do: 1
-  defp run_bit(:c2h), do: 2
-  defp desc_bit(:h2c), do: 4
-  defp desc_bit(:c2h), do: 8
+  defp ctrl_update(d, ch, f) do
+    reg = Regs.pair_reg(:ctrl, elem(Regs.split_channel(ch), 1))
+    {reg, f.(Map.get(d.ctrl, reg, 0))}
+  end
+
+  defp run_bit(ch), do: if(elem(Regs.split_channel(ch), 0) == :h2c, do: 1, else: 2)
+  defp desc_bit(ch), do: if(elem(Regs.split_channel(ch), 0) == :h2c, do: 4, else: 8)
 
   defp w(core, reg, v), do: Core.mmio_write(core, Regs.offset(reg), v)
 end

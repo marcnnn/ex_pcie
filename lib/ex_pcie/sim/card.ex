@@ -17,7 +17,9 @@ defmodule ExPcie.Sim.Card do
   Time passes only inside BAR0 accesses and `advance/2`. Options of
   `open/1`: `loopback:` (default true; the user streams are looped
   inside the endpoint; without it feed and drain them through your own
-  `ExPcie.Model.Stream` agents with `agents:`), `vectors:` (2), and
+  `ExPcie.Model.Stream` agents with `agents:`), `pairs:` (channel pairs,
+  default 1; with `loopback` every pair loops its own streams),
+  `seg_last:` (as `ExPcie.RTL.Endpoint`), `vectors:` (`2 * pairs`), and
   every option of `ExPcie.Model.Core.new/1` (`seed`, `mps`, `latency`,
   `rc_valid`, ...). The simulated "kernel" assigns MSI-X vector `v` the
   address `0xFEE00000 + 16 v` and data `0x4000 + v` and writes the table.
@@ -58,10 +60,18 @@ defmodule ExPcie.Sim.Card do
 
   @impl true
   def init(opts) do
-    vectors = Keyword.get(opts, :vectors, 2)
+    pairs = Keyword.get(opts, :pairs, 1)
+    vectors = Keyword.get(opts, :vectors, 2 * pairs)
     loopback = Keyword.get(opts, :loopback, true)
-    core_opts = Keyword.drop(opts, [:vectors, :loopback, :agents])
-    mod = Endpoint.build(vectors: vectors, loopback: loopback)
+    core_opts = Keyword.drop(opts, [:vectors, :loopback, :agents, :pairs, :seg_last])
+
+    mod =
+      Endpoint.build(
+        vectors: vectors,
+        loopback: loopback,
+        pairs: pairs,
+        seg_last: Keyword.get(opts, :seg_last, false)
+      )
 
     {:ok,
      %{

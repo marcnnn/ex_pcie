@@ -13,6 +13,12 @@ defmodule ExPcie.Host do
       :ok = ExPcie.Device.subscribe_irq(dev, ExPcie.Host.vector(:c2h))
       receive do {:ex_pcie_irq, _, 1} -> ExPcie.Host.ptr(dev, :c2h) end
 
+  Pairs: with an endpoint built with `pairs: n` the channel functions take
+  `pair: p` (default 0, the pair of the unchanged register map), and
+  `ExPcie.Regs.channel/2` names the channel (`:h2c`, `:h2c1`, ...) for the
+  register-by-name functions and `ExPcie.Host.Ring`. `pairs/1` reads the
+  count.
+
   The MSI-X table lives in BAR0 (`ExPcie.RTL.Endpoint`) but is written by
   the kernel when interrupts are enabled through vfio (`irq_kind:
   :msix`); this module does not touch it except in `program_msix/4`, for
@@ -24,7 +30,7 @@ defmodule ExPcie.Host do
   alias ExPcie.Regs
 
   @id 0x50434945
-  @map Regs.map(32)
+  @map Regs.map(32, Regs.max_pairs())
   @regs Map.new(@map.registers, &{&1.name, &1.offset})
 
   @doc "Byte offset of a BAR0 register (`ExPcie.Regs` register map)."
@@ -37,9 +43,18 @@ defmodule ExPcie.Host do
   def write_fields(dev, name, fields),
     do: write(dev, name, ExHdl.Regs.encode(@map, name, fields))
 
-  @doc "MSI-X vector of a channel: `:h2c` 0, `:c2h` 1."
-  def vector(:h2c), do: 0
-  def vector(:c2h), do: 1
+  @doc "MSI-X vector of a channel: `:h2c` 0, `:c2h` 1; pair `p` has `2 p` and `2 p + 1`."
+  def vector(dir, pair \\ 0)
+  def vector(:h2c, pair), do: 2 * pair
+  def vector(:c2h, pair), do: 2 * pair + 1
+
+  @doc "Number of channel pairs of the endpoint (1 when the `pairs` register is absent)."
+  def pairs(dev) do
+    case Device.read32(dev, 0, offset(:pairs)) do
+      {:ok, n} when n in 1..4 -> n
+      _ -> 1
+    end
+  end
 
   @doc "Reads a register by name."
   def read(dev, name) do
@@ -62,7 +77,7 @@ defmodule ExPcie.Host do
   Starts the host-to-card channel on `buf` (an `ExPcie.Device` DMA buffer
   whose ring the host fills). Options: `ring:` ring bytes (default the
   buffer size), `period:` bytes per interrupt, `offset:` byte offset of
-  the ring in the buffer (0). `ring` and `period` must be multiples of 32
+  the ring in the buffer (0), `pair:` the channel pair (0). `ring` and `period` must be multiples of 32
   and `ring` a multiple of `period`; the bus address 32-byte aligned.
   """
   def start_h2c(dev, %DmaBuffer{} = buf, opts), do: start(dev, :h2c, 0, buf, opts)
@@ -70,7 +85,10 @@ defmodule ExPcie.Host do
   @doc "Starts the card-to-host channel on `buf`; options as `start_h2c/3`."
   def start_c2h(dev, %DmaBuffer{} = buf, opts), do: start(dev, :c2h, 1, buf, opts)
 
-  defp start(dev, ch, bit, buf, opts) do
+  defp start(dev, dir, bit, buf, opts) do
+    pair = Keyword.get(opts, :pair, 0)
+    ch = Regs.channel(dir, pair)
+    ctrl = Regs.pair_reg(:ctrl, pair)
     ring = Keyword.get(opts, :ring, buf.size)
     period = Keyword.fetch!(opts, :period)
     off = Keyword.get(opts, :offset, 0)
@@ -91,32 +109,37 @@ defmodule ExPcie.Host do
         write(dev, :"#{ch}_base_hi", addr >>> 32)
         write(dev, :"#{ch}_ring", ring)
         write(dev, :"#{ch}_period", period)
-        write(dev, :ctrl, read(dev, :ctrl) ||| 1 <<< bit)
+        write(dev, ctrl, read(dev, ctrl) ||| 1 <<< bit)
     end
   end
 
-  @doc "Stops a channel (`:h2c` or `:c2h`); it restarts from the ring start when started again."
-  def stop(dev, :h2c), do: write(dev, :ctrl, read(dev, :ctrl) &&& ~~~1)
-  def stop(dev, :c2h), do: write(dev, :ctrl, read(dev, :ctrl) &&& ~~~2)
+  @doc "Stops a channel (`:h2c` or `:c2h`) of pair `pair`; it restarts from the ring start when started again."
+  def stop(dev, dir, pair \\ 0) do
+    ctrl = Regs.pair_reg(:ctrl, pair)
+    write(dev, ctrl, read(dev, ctrl) &&& ~~~run_bit(dir))
+  end
+
+  defp run_bit(:h2c), do: 1
+  defp run_bit(:c2h), do: 2
 
   @doc "Ring offset in bytes the channel has delivered (`:h2c`, consumed by the card) or completed (`:c2h`, written to host memory)."
-  def ptr(dev, :h2c), do: read(dev, :h2c_ptr)
-  def ptr(dev, :c2h), do: read(dev, :c2h_ptr)
+  def ptr(dev, dir, pair \\ 0) when dir in [:h2c, :c2h],
+    do: read(dev, :"#{Regs.channel(dir, pair)}_ptr")
 
-  @doc "Status bits: `%{h2c_period: bool, c2h_period: bool, h2c_error: bool}`."
-  def status(dev) do
-    s = read(dev, :status)
+  @doc "Status bits of pair `pair`: `%{h2c_period: bool, c2h_period: bool, h2c_error: bool}`."
+  def status(dev, pair \\ 0) do
+    s = read(dev, Regs.pair_reg(:status, pair))
     %{h2c_period: (s &&& 1) == 1, c2h_period: (s &&& 2) == 2, h2c_error: (s &&& 4) == 4}
   end
 
   @doc "Clears the status bits in `mask` (write-1-to-clear)."
-  def clear_status(dev, mask \\ 7), do: write(dev, :status, mask)
+  def clear_status(dev, mask \\ 7, pair \\ 0), do: write(dev, Regs.pair_reg(:status, pair), mask)
 
   @doc "Raises interrupt vector `vec` from software (through the interrupt controller)."
   def force_irq(dev, vec), do: write(dev, :irq_force, 1 <<< vec)
 
   @doc "Completion errors the H2C channel has seen."
-  def h2c_errors(dev), do: read(dev, :h2c_err)
+  def h2c_errors(dev, pair \\ 0), do: read(dev, :"#{Regs.channel(:h2c, pair)}_err")
 
   @doc """
   Bytes between ring offsets `from` and `to` (the C2H pointer), wrapping

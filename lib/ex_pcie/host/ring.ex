@@ -16,11 +16,14 @@ defmodule ExPcie.Host.Ring do
 
   `open/3` programs the registers but does not start the channel; the
   `desc` and `run` bits are set by `start/1` (the other channel's bits
-  are kept). Setup order and rules: `ExPcie.DRing`.
+  are kept). Setup order and rules: `ExPcie.DRing`. The channel is `:h2c`
+  or `:c2h` of pair 0, `ExPcie.Regs.channel/2` names the ones of another
+  pair (`Ring.open(dev, Regs.channel(:c2h, 1))`), which use that pair's
+  registers.
   """
   import Bitwise
 
-  alias ExPcie.{Device, DRing, Host}
+  alias ExPcie.{Device, DRing, Host, Regs}
   alias ExPcie.Device.DmaBuffer
 
   defstruct [:dev, :ch, :buf, :entries, :wb_off, :wb, head: 0, reaped: 0, posted: %{}]
@@ -32,8 +35,9 @@ defmodule ExPcie.Host.Ring do
   Options: `entries:` (64), `wb:` `:both` (default), `:desc`, `:head`,
   `:none`, `irq:` (false).
   """
-  @spec open(Device.t(), :h2c | :c2h, keyword()) :: {:ok, t()} | {:error, term()}
-  def open(dev, ch, opts \\ []) when ch in [:h2c, :c2h] do
+  @spec open(Device.t(), atom(), keyword()) :: {:ok, t()} | {:error, term()}
+  def open(dev, ch, opts \\ []) when is_atom(ch) do
+    _ = Regs.split_channel(ch)
     entries = Keyword.get(opts, :entries, 64)
     wb = Keyword.get(opts, :wb, :both)
     wb_off = entries * DRing.size()
@@ -66,18 +70,21 @@ defmodule ExPcie.Host.Ring do
   @doc "Sets the `desc` and `run` bits of the channel."
   def start(%__MODULE__{dev: dev, ch: ch}) do
     {run, desc} = bits(ch)
-    Host.write(dev, :ctrl, Host.read(dev, :ctrl) ||| run ||| desc)
+    ctrl = ctrl(ch)
+    Host.write(dev, ctrl, Host.read(dev, ctrl) ||| run ||| desc)
   end
 
   @doc "Clears the run bit (the card resets the ring) and restarts the indices."
   def stop(%__MODULE__{dev: dev, ch: ch} = r) do
     {run, _} = bits(ch)
-    :ok = Host.write(dev, :ctrl, Host.read(dev, :ctrl) &&& ~~~run)
+    ctrl = ctrl(ch)
+    :ok = Host.write(dev, ctrl, Host.read(dev, ctrl) &&& ~~~run)
     %{r | head: 0, reaped: 0, posted: %{}}
   end
 
-  defp bits(:h2c), do: {1, 4}
-  defp bits(:c2h), do: {2, 8}
+  defp bits(ch), do: if(elem(Regs.split_channel(ch), 0) == :h2c, do: {1, 4}, else: {2, 8})
+
+  defp ctrl(ch), do: Regs.pair_reg(:ctrl, elem(Regs.split_channel(ch), 1))
 
   @doc "Descriptors that can still be posted."
   def space(%__MODULE__{} = r), do: r.entries - 1 - rem(r.head - r.reaped + r.entries, r.entries)
