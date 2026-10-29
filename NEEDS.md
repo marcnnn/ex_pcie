@@ -147,6 +147,9 @@ the shared RC stream is fanned out by plain inputs on the extra consumers
 (`DescRing` has `rc_tdata`, `rc_tvalid`, `rc_tlast` and no `tready`), the
 workaround for item 2: a consumer that only listens has no unused output.
 For `DescRing` `stop: false` omits the `d_stop` port for the same reason.
+The channel pairs of `Dma` use the same workaround for the H2C channels
+of pair 1 and up (`H2c.build(rc_shared: true)`: plain `rc_*` inputs, no
+`tready`).
 A wish that follows from it: `slave/2` interfaces whose `tready` is
 optional (a listener flag), so a second consumer of a stream is a normal
 `connect/2`.
