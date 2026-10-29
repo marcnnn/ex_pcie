@@ -37,6 +37,12 @@ defmodule ExPcie.RTL.RqMux do
   `rq` (master), and `done` (`n` bits), bit `i` pulsing in the cycle the
   last beat of a packet from producer `i` is transferred on `rq`. With
   `n = 2` it is `build/0` with the ports renamed.
+
+  The arbiter is the default of `packet_mux/2`, `:round_robin` with the
+  grant held until `tlast`: between packets the producer after the one
+  served last that has a packet waiting wins, so with `n` producers none
+  waits for more than `n - 1` packets of the others. `ExPcie.RTL.Dma` uses
+  it with four producers per channel pair; the share is per packet.
   """
   def build_n(n) when n >= 2 do
     mux = AXIS.packet_mux(n, data: Ifc.dw(), keep_bits: div(Ifc.dw(), 32), user: 62, src: false)

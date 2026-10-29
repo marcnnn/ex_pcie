@@ -10,6 +10,20 @@ defmodule ExPcie.RTL.Endpoint do
   `ExPcie.RTL.IrqCtrl`, and the user streams `h2c_axis` (master) and
   `c2h_axis` (slave).
 
+  ## More channel pairs
+
+  `pairs: n` (1 to 4, default 1) builds `n` channel pairs, each one H2C
+  and one C2H channel with its own descriptor ring, simple-ring registers
+  and user streams. Pair 0 is exactly the single pair above; pair `p`
+  has the streams `h2c<p>_axis` (master) and `c2h<p>_axis` (slave)
+  (`h2c1_axis`, `c2h1_axis`, ...) and its registers at `0x200 * p` (see
+  `ExPcie.Regs`). The option `seg_last:` (`true` for all pairs, or a list
+  of pair numbers; default `false`) gives the H2C streams of those pairs a
+  `tlast` on the last beat of each descriptor segment
+  (`ExPcie.RTL.H2c`), e.g. `seg_last: [1]` for a packet pair next to an
+  audio pair 0. PCIe tags, completion routing and the fairness of the RQ
+  port are described in `ExPcie.RTL.Dma`.
+
   ## BAR0 register map (32-bit, byte offsets, 16 KiB)
 
   Declared in `ExPcie.Regs` (`defregs`-style map; the module has the table,
@@ -42,8 +56,10 @@ defmodule ExPcie.RTL.Endpoint do
   stream feeds the C2H stream inside (a packet every four beats), a
   self-test of the whole path for board bring-up.
 
-  Vector 0 is the H2C period, vector 1 the C2H period; further vectors
-  (`vectors:` option) are only raised through `IRQ_FORCE`.
+  Vector `2 p` is the H2C period or descriptor interrupt of pair `p`,
+  vector `2 p + 1` the C2H one (vector 0 H2C, 1 C2H with one pair); further
+  vectors (`vectors:` option, at least `2 * pairs`, the default) are only
+  raised through `IRQ_FORCE`.
   Software starts a channel by writing base, ring and period, then the
   run bit; clearing the run bit resets it.
   """
@@ -84,8 +100,18 @@ defmodule ExPcie.RTL.Endpoint do
   end
 
   def build(opts \\ []) do
-    vectors = Keyword.get(opts, :vectors, 2)
+    pairs = Keyword.get(opts, :pairs, 1)
+    vectors = Keyword.get(opts, :vectors, 2 * pairs)
     loopback = Keyword.get(opts, :loopback, false)
+
+    seg_last =
+      case Keyword.get(opts, :seg_last, false) do
+        true -> Enum.to_list(0..(pairs - 1))
+        false -> []
+        list when is_list(list) -> list
+      end
+
+    if vectors < 2 * pairs, do: raise(ArgumentError, "#{pairs} pairs need #{2 * pairs} vectors")
     extra = extras(Keyword.get(opts, :extra, []))
 
     ab =
@@ -95,7 +121,7 @@ defmodule ExPcie.RTL.Endpoint do
       |> Builder.ceil_log2()
       |> max(14)
 
-    regfile = Regs.rtl(vectors)
+    regfile = Regs.rtl(vectors, pairs)
 
     xbar =
       if extra != [],
@@ -110,19 +136,28 @@ defmodule ExPcie.RTL.Endpoint do
         do: "",
         else: "_x" <> Enum.map_join(extra, "_", &"#{&1.name}#{Integer.to_string(&1.base, 16)}")
 
-    module "pcie_endpoint_#{vectors}#{if loopback, do: "_loopback", else: ""}#{tag}" do
+    pair_tag =
+      if pairs == 1,
+        do: "",
+        else: "_p#{pairs}#{if seg_last != [], do: "sl" <> Enum.join(seg_last), else: ""}"
+
+    module "pcie_endpoint_#{vectors}#{pair_tag}#{if loopback, do: "_loopback", else: ""}#{tag}" do
       cq = slave(:cq, Ifc.cq())
       cc = master(:cc, Ifc.cc())
       rq = master(:rq, Ifc.rq())
       rc = slave(:rc, Ifc.rc())
 
-      hs =
-        if loopback,
-          do: nil,
-          else: master(:h2c_axis, Interface.axi_stream(data: 256, keep: false, last: false))
+      streams =
+        for p <- 0..(pairs - 1), not loopback do
+          hp = Dma.pfx(:h2c, p)
+          cp = Dma.pfx(:c2h, p)
 
-      cs =
-        if loopback, do: nil, else: slave(:c2h_axis, Interface.axi_stream(data: 256, keep: false))
+          {p,
+           master(
+             :"#{hp}_axis",
+             Interface.axi_stream(data: 256, keep: false, last: p in seg_last)
+           ), slave(:"#{cp}_axis", Interface.axi_stream(data: 256, keep: false))}
+        end
 
       np_req = output(:cq_np_req, 2)
       mps = input(:cfg_max_payload, 3)
@@ -131,7 +166,13 @@ defmodule ExPcie.RTL.Endpoint do
 
       br = instance(:br, Bar0Bridge.build(addr_bits: ab))
       rf = instance(:rf, regfile)
-      dma = instance(:dma, Dma.build())
+
+      dma =
+        instance(
+          :dma,
+          Dma.build(pairs: pairs, seg_last: if(loopback, do: false, else: seg_last))
+        )
+
       ic = instance(:ic, IrqCtrl.build(vectors: vectors))
 
       for n <- [
@@ -197,69 +238,91 @@ defmodule ExPcie.RTL.Endpoint do
       connect(rc, dma.rc)
 
       if loopback do
-        lb = reg(:lb_cnt, 2)
-        dma.c2h_axis.tdata <~ dma.h2c_axis.tdata
-        dma.c2h_axis.tvalid <~ dma.h2c_axis.tvalid
-        dma.h2c_axis.tready <~ dma.c2h_axis.tready
-        dma.c2h_axis.tlast <~ (lb == 3)
+        for p <- 0..(pairs - 1) do
+          hp = Dma.pfx(:h2c, p)
+          cp = Dma.pfx(:c2h, p)
+          lb = reg(if(p == 0, do: :lb_cnt, else: :"lb_cnt#{p}"), 2)
+          dma[:"#{cp}_axis"].tdata <~ dma[:"#{hp}_axis"].tdata
+          dma[:"#{cp}_axis"].tvalid <~ dma[:"#{hp}_axis"].tvalid
+          dma[:"#{hp}_axis"].tready <~ dma[:"#{cp}_axis"].tready
+          dma[:"#{cp}_axis"].tlast <~ (lb == 3)
 
-        sync do
-          if dma.h2c_axis.tvalid and dma.c2h_axis.tready, do: lb <~ add_wrap(lb, 1)
+          sync do
+            if dma[:"#{hp}_axis"].tvalid and dma[:"#{cp}_axis"].tready,
+              do: lb <~ add_wrap(lb, 1)
+          end
         end
       else
-        connect(dma.h2c_axis, hs)
-        connect(cs, dma.c2h_axis)
+        for {p, hs, cs} <- streams do
+          connect(dma[:"#{Dma.pfx(:h2c, p)}_axis"], hs)
+          connect(cs, dma[:"#{Dma.pfx(:c2h, p)}_axis"])
+        end
       end
 
       dma.cfg_max_payload <~ mps
       dma.cfg_max_read_req <~ mrrs
 
-      dma.h2c_run <~ rf.ctrl_h2c_run
-      dma.c2h_run <~ rf.ctrl_c2h_run
-      dma.h2c_desc <~ rf.ctrl_h2c_desc
-      dma.c2h_desc <~ rf.ctrl_c2h_desc
       dma.timeout_cycles <~ rf.timeout_cycles
 
-      for ch <- [:h2c, :c2h] do
-        dma[:"#{ch}_base"] <~ cat([rf[:"#{ch}_base_hi_value"], rf[:"#{ch}_base_lo_value"]])
-        dma[:"#{ch}_ring_bytes"] <~ rf[:"#{ch}_ring_value"]
-        dma[:"#{ch}_period_bytes"] <~ rf[:"#{ch}_period_value"]
-        rf[:"#{ch}_ptr_value"] <~ dma[:"#{ch}_ptr"]
+      irqs =
+        for p <- 0..(pairs - 1) do
+          ctrl = Regs.pair_reg(:ctrl, p)
+          status = Regs.pair_reg(:status, p)
+          hp = Regs.channel(:h2c, p)
+          cp = Regs.channel(:c2h, p)
 
-        dma[:"#{ch}_dbase"]
-        <~ cat([rf[:"#{ch}_dbase_hi_value"], rf[:"#{ch}_dbase_lo_value"]])
+          dma[:"#{hp}_run"] <~ rf[:"#{ctrl}_h2c_run"]
+          dma[:"#{cp}_run"] <~ rf[:"#{ctrl}_c2h_run"]
+          dma[:"#{hp}_desc"] <~ rf[:"#{ctrl}_h2c_desc"]
+          dma[:"#{cp}_desc"] <~ rf[:"#{ctrl}_c2h_desc"]
 
-        dma[:"#{ch}_dsize"] <~ rf[:"#{ch}_dsize_value"]
-        dma[:"#{ch}_dhead"] <~ rf[:"#{ch}_dhead_value"]
-        dma[:"#{ch}_wb"] <~ cat([rf[:"#{ch}_wb_hi_value"], rf[:"#{ch}_wb_lo_value"]])
-        dma[:"#{ch}_wb_desc"] <~ rf[:"#{ch}_dctrl_wb_desc"]
-        dma[:"#{ch}_wb_head"] <~ rf[:"#{ch}_dctrl_wb_head"]
-        dma[:"#{ch}_irq_en"] <~ rf[:"#{ch}_dctrl_irq_en"]
-        rf[:"#{ch}_dtail_value"] <~ dma[:"#{ch}_dtail"]
-        rf[:"#{ch}_dcount_value"] <~ dma[:"#{ch}_dcount"]
-        rf[:"#{ch}_dfetch_value"] <~ dma[:"#{ch}_dfetch"]
-        rf[:"#{ch}_dstat_halted"] <~ dma[:"#{ch}_dstat"][0]
-        rf[:"#{ch}_dstat_bad_desc"] <~ dma[:"#{ch}_dstat"][1]
-        rf[:"#{ch}_dstat_fetch_error"] <~ dma[:"#{ch}_dstat"][2]
-      end
+          for ch <- [hp, cp] do
+            dma[:"#{ch}_base"] <~ cat([rf[:"#{ch}_base_hi_value"], rf[:"#{ch}_base_lo_value"]])
+            dma[:"#{ch}_ring_bytes"] <~ rf[:"#{ch}_ring_value"]
+            dma[:"#{ch}_period_bytes"] <~ rf[:"#{ch}_period_value"]
+            rf[:"#{ch}_ptr_value"] <~ dma[:"#{ch}_ptr"]
 
-      rf.h2c_err_value <~ zext(dma.h2c_err_count, 32)
-      rf.c2h_pkt_value <~ zext(dma.c2h_pkt_count, 32)
+            dma[:"#{ch}_dbase"]
+            <~ cat([rf[:"#{ch}_dbase_hi_value"], rf[:"#{ch}_dbase_lo_value"]])
 
-      err_prev = reg(:err_prev, 16)
-      err_ev = wire(:err_ev, dma.h2c_err_count != err_prev)
+            dma[:"#{ch}_dsize"] <~ rf[:"#{ch}_dsize_value"]
+            dma[:"#{ch}_dhead"] <~ rf[:"#{ch}_dhead_value"]
+            dma[:"#{ch}_wb"] <~ cat([rf[:"#{ch}_wb_hi_value"], rf[:"#{ch}_wb_lo_value"]])
+            dma[:"#{ch}_wb_desc"] <~ rf[:"#{ch}_dctrl_wb_desc"]
+            dma[:"#{ch}_wb_head"] <~ rf[:"#{ch}_dctrl_wb_head"]
+            dma[:"#{ch}_irq_en"] <~ rf[:"#{ch}_dctrl_irq_en"]
+            rf[:"#{ch}_dtail_value"] <~ dma[:"#{ch}_dtail"]
+            rf[:"#{ch}_dcount_value"] <~ dma[:"#{ch}_dcount"]
+            rf[:"#{ch}_dfetch_value"] <~ dma[:"#{ch}_dfetch"]
+            rf[:"#{ch}_dstat_halted"] <~ dma[:"#{ch}_dstat"][0]
+            rf[:"#{ch}_dstat_bad_desc"] <~ dma[:"#{ch}_dstat"][1]
+            rf[:"#{ch}_dstat_fetch_error"] <~ dma[:"#{ch}_dstat"][2]
+          end
 
-      sync do
-        err_prev <~ dma.h2c_err_count
-      end
+          rf[:"#{hp}_err_value"] <~ zext(dma[:"#{hp}_err_count"], 32)
+          rf[:"#{cp}_pkt_value"] <~ zext(dma[:"#{cp}_pkt_count"], 32)
 
-      rf.status_h2c_period_set <~ dma.h2c_irq
-      rf.status_c2h_period_set <~ dma.c2h_irq
-      rf.status_h2c_error_set <~ err_ev
-      status_o <~ cat([rf.status_h2c_error, rf.status_c2h_period, rf.status_h2c_period])
+          err_prev = reg(if(p == 0, do: :err_prev, else: :"err_prev#{p}"), 16)
+
+          err_ev =
+            wire(:"err_ev#{if p == 0, do: "", else: p}", dma[:"#{hp}_err_count"] != err_prev)
+
+          sync do
+            err_prev <~ dma[:"#{hp}_err_count"]
+          end
+
+          rf[:"#{status}_h2c_period_set"] <~ dma[:"#{hp}_irq"]
+          rf[:"#{status}_c2h_period_set"] <~ dma[:"#{cp}_irq"]
+          rf[:"#{status}_h2c_error_set"] <~ err_ev
+
+          if p == 0,
+            do: status_o <~ cat([rf.status_h2c_error, rf.status_c2h_period, rf.status_h2c_period])
+
+          [dma[:"#{hp}_irq"], dma[:"#{cp}_irq"]]
+        end
 
       ic.req
-      <~ (zext(cat([dma.c2h_irq, dma.h2c_irq]), vectors) |||
+      <~ (zext(cat(Enum.reverse(List.flatten(irqs))), vectors) |||
             (rf.irq_force_vec &&& rep(rf.irq_force_wr, vectors)))
 
       idx = 0..(vectors - 1)
