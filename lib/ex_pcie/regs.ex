@@ -32,6 +32,34 @@ defmodule ExPcie.Regs do
   | 0x100C + 16 i | `msix<i>_ctrl` | `mask` [0] (rw, reset 1) |
   | 0x2000 | `pba` | `value` (ro) |
 
+  ## More channel pairs
+
+  With `pairs: n` (2 to 4) pair `p` (1 to `n - 1`) gets a copy of the
+  pair-0 channel registers in the free space at `0x200 * p`: every
+  channel register of the table above from 0x010 to 0x16F (`ctrl`,
+  `status`, the channel registers, the descriptor ring registers) is
+  found at `0x200 * p` plus the pair-0 offset, with the pair number
+  appended to the channel part of the name:
+
+  | Offset | Register | Fields |
+  |---|---|---|
+  | 0x200 p + 0x010 | `ctrl<p>` | `h2c_run` [0], `c2h_run` [1], `h2c_desc` [2], `c2h_desc` [3] (rw) |
+  | 0x200 p + 0x014 | `status<p>` | `h2c_period` [0], `c2h_period` [1], `h2c_error` [2] (w1c) |
+  | 0x200 p + 0x020 | `h2c<p>_base_lo`, `h2c<p>_base_hi`, `h2c<p>_ring`, `h2c<p>_period` | `value` (rw) |
+  | 0x200 p + 0x030 | `h2c<p>_ptr`, `h2c<p>_err` | `value` (ro) |
+  | 0x200 p + 0x040 | `c2h<p>_base_lo` ... `c2h<p>_period` | `value` (rw) |
+  | 0x200 p + 0x050 | `c2h<p>_ptr`, `c2h<p>_pkt` | `value` (ro) |
+  | 0x200 p + 0x100 / 0x140 | `h2c<p>_dbase_lo` ... `h2c<p>_dfetch` (and `c2h<p>_`) | as pair 0 |
+
+  The ID, `caps`, `timeout`, `irq_force`, `irq_pending`, the error counters,
+  the MSI-X table and the PBA exist once; `timeout` applies to all pairs.
+  `pairs` at 0x008 (`count` [3:0], ro) holds the number of pairs; with one
+  pair that address is a hole as before.
+  MSI-X vector `2 p` is the H2C and `2 p + 1` the C2H interrupt of pair
+  `p`, so the map has at least `2 * pairs` vectors. `channel/2` and
+  `split_channel/1` convert between a pair number and the channel name
+  used in the register names (`:h2c`, `:h2c1`, ...).
+
   What changed against the stand-in: the read of `caps` and `id` need no
   hardware input (constants), the `ctrl` and `status` bits are named
   fields (`ctrl_h2c_run`, `status_h2c_error_set`), `irq_force` is a
@@ -42,13 +70,50 @@ defmodule ExPcie.Regs do
   use ExHdl.Regs
 
   @id 0x50434945
+  @max_pairs 4
+  @pair_stride 0x200
 
-  @doc "The register map for `vectors` MSI-X vectors (2 to 32, default 2)."
-  @spec map(pos_integer()) :: ExHdl.Regs.t()
-  def map(vectors \\ 2) do
+  @doc "Most channel pairs a map can have."
+  def max_pairs, do: @max_pairs
+
+  @doc "Byte offset of the register block of channel pair `pair` (0 for pair 0)."
+  def pair_base(pair), do: @pair_stride * pair
+
+  @doc "Channel name of `dir` (`:h2c` or `:c2h`) in pair `pair`: `:h2c`, `:h2c1`, `:c2h2`, ..."
+  def channel(dir, 0) when dir in [:h2c, :c2h], do: dir
+  def channel(dir, pair) when dir in [:h2c, :c2h], do: :"#{dir}#{pair}"
+
+  @doc "`{dir, pair}` of a channel name (inverse of `channel/2`)."
+  def split_channel(ch) do
+    case Atom.to_string(ch) do
+      "h2c" <> n -> {:h2c, pair_num(n)}
+      "c2h" <> n -> {:c2h, pair_num(n)}
+    end
+  end
+
+  defp pair_num(""), do: 0
+  defp pair_num(n), do: String.to_integer(n)
+
+  @doc "Name of the `ctrl` or `status` register of a pair (`:ctrl`, `:ctrl1`, ...)."
+  def pair_reg(name, 0), do: name
+  def pair_reg(name, pair), do: :"#{name}#{pair}"
+
+  @doc """
+  The register map for `vectors` MSI-X vectors (1 to 32, default 2) and
+  `pairs` channel pairs (1 to 4, default 1; with more than one pair
+  `vectors` must be at least `2 * pairs`).
+  """
+  @spec map(pos_integer(), pos_integer()) :: ExHdl.Regs.t()
+  def map(vectors \\ 2, pairs \\ 1) do
     unless vectors in 1..32, do: raise(ArgumentError, "vectors must be 1..32")
+    unless pairs in 1..@max_pairs, do: raise(ArgumentError, "pairs must be 1..#{@max_pairs}")
 
-    regmap "pcie_endpoint_regs_#{vectors}", addr_width: 14, doc: "PCIe endpoint BAR0" do
+    if pairs > 1 and vectors < 2 * pairs,
+      do: raise(ArgumentError, "#{pairs} pairs need at least #{2 * pairs} vectors")
+
+    suffix = if pairs == 1, do: "", else: "_p#{pairs}"
+
+    regmap "pcie_endpoint_regs_#{vectors}#{suffix}", addr_width: 14, doc: "PCIe endpoint BAR0" do
       register :id, offset: 0x000, doc: "Identification" do
         field :value, 0..31, :ro, const: @id
       end
@@ -57,6 +122,12 @@ defmodule ExPcie.Regs do
         field :vectors, 0..7, :ro, const: vectors, doc: "MSI-X vectors"
         field :stream_bytes, 8..15, :ro, const: 32, doc: "User stream bytes per beat"
         field :desc, 16, :ro, const: 1, doc: "Descriptor rings available"
+      end
+
+      if pairs > 1 do
+        register :pairs, offset: 0x008, doc: "Channel pairs (a hole with one pair)" do
+          field :count, 0..3, :ro, const: pairs, doc: "Channel pairs"
+        end
       end
 
       register :ctrl, offset: 0x010, doc: "Channel run bits" do
@@ -164,6 +235,93 @@ defmodule ExPcie.Regs do
         field :value, 0..31, :ro
       end
 
+      for p <- 1..(pairs - 1)//1 do
+        b = @pair_stride * p
+        h = channel(:h2c, p)
+        c = channel(:c2h, p)
+
+        register pair_reg(:ctrl, p), offset: b + 0x010, doc: "Channel run bits of pair #{p}" do
+          field :h2c_run, 0, :rw, doc: "Host to card channel runs"
+          field :c2h_run, 1, :rw, doc: "Card to host channel runs"
+          field :h2c_desc, 2, :rw, doc: "H2C uses its descriptor ring (0: simple ring)"
+          field :c2h_desc, 3, :rw, doc: "C2H uses its descriptor ring (0: simple ring)"
+        end
+
+        register pair_reg(:status, p),
+          offset: b + 0x014,
+          doc: "Sticky status of pair #{p}, write 1 to clear" do
+          field :h2c_period, 0, :w1c,
+            doc: "H2C period delivered (descriptor mode: descriptor done)"
+
+          field :c2h_period, 1, :w1c, doc: "C2H period written (descriptor mode: descriptor done)"
+          field :h2c_error, 2, :w1c, doc: "H2C completion error seen"
+        end
+
+        for {ch, off} <- [{h, 0x020}, {c, 0x040}] do
+          for {n, o} <- [base_lo: 0, base_hi: 4, ring: 8, period: 12] do
+            register :"#{ch}_#{n}", offset: b + off + o do
+              field :value, 0..31, :rw
+            end
+          end
+        end
+
+        register :"#{h}_ptr", offset: b + 0x030, doc: "H2C bytes delivered, modulo ring" do
+          field :value, 0..31, :ro
+        end
+
+        register :"#{h}_err", offset: b + 0x034, doc: "H2C completion errors" do
+          field :value, 0..31, :ro
+        end
+
+        register :"#{c}_ptr", offset: b + 0x050, doc: "C2H bytes written, modulo ring" do
+          field :value, 0..31, :ro
+        end
+
+        register :"#{c}_pkt", offset: b + 0x054, doc: "C2H TLPs written" do
+          field :value, 0..31, :ro
+        end
+
+        for {ch, base} <- [{h, b + 0x100}, {c, b + 0x140}] do
+          for {n, off} <- [dbase_lo: 0x00, dbase_hi: 0x04, wb_lo: 0x18, wb_hi: 0x1C] do
+            register :"#{ch}_#{n}", offset: base + off do
+              field :value, 0..31, :rw
+            end
+          end
+
+          register :"#{ch}_dsize", offset: base + 0x08, doc: "Descriptors in the ring" do
+            field :value, 0..15, :rw
+          end
+
+          register :"#{ch}_dhead", offset: base + 0x0C, doc: "Doorbell: producer index" do
+            field :value, 0..15, :rw
+          end
+
+          register :"#{ch}_dtail", offset: base + 0x10, doc: "Next descriptor to complete" do
+            field :value, 0..15, :ro
+          end
+
+          register :"#{ch}_dstat", offset: base + 0x14, doc: "Descriptor ring status" do
+            field :halted, 0, :ro, doc: "Ring halted (cleared by run low)"
+            field :bad_desc, 1, :ro, doc: "Misaligned or empty descriptor"
+            field :fetch_error, 2, :ro, doc: "Descriptor read failed or timed out"
+          end
+
+          register :"#{ch}_dctrl", offset: base + 0x20, doc: "Descriptor ring options" do
+            field :wb_desc, 0, :rw, doc: "Write status into the descriptor on completion"
+            field :wb_head, 1, :rw, doc: "Write the head block to the write-back address"
+            field :irq_en, 2, :rw, doc: "Descriptors with the IRQ flag raise the interrupt"
+          end
+
+          register :"#{ch}_dcount", offset: base + 0x24, doc: "Descriptors completed" do
+            field :value, 0..31, :ro
+          end
+
+          register :"#{ch}_dfetch", offset: base + 0x28, doc: "Next descriptor to fetch" do
+            field :value, 0..15, :ro
+          end
+        end
+      end
+
       for i <- 0..(vectors - 1) do
         base = 0x1000 + 16 * i
 
@@ -184,21 +342,22 @@ defmodule ExPcie.Regs do
     end
   end
 
-  @doc "Byte offset of register `name` (`map/1` with 32 vectors covers every name)."
-  def offset(name), do: ExHdl.Regs.offset(map(32), name)
+  @doc "Byte offset of register `name` (`map/2` with 32 vectors and 4 pairs covers every name)."
+  def offset(name), do: ExHdl.Regs.offset(map(32, @max_pairs), name)
 
   @doc "Register word from field values."
-  def encode(name, fields), do: ExHdl.Regs.encode(map(32), name, fields)
+  def encode(name, fields), do: ExHdl.Regs.encode(map(32, @max_pairs), name, fields)
 
   @doc "Field values of a register word."
-  def decode(name, word), do: ExHdl.Regs.decode(map(32), name, word)
+  def decode(name, word), do: ExHdl.Regs.decode(map(32, @max_pairs), name, word)
 
-  @doc "The AXI4-Lite slave of `map/1` (holes answer SLVERR)."
-  def rtl(vectors \\ 2), do: ExHdl.Regs.RTL.build(map(vectors), unmapped: :slverr)
+  @doc "The AXI4-Lite slave of `map/2` (holes answer SLVERR)."
+  def rtl(vectors \\ 2, pairs \\ 1),
+    do: ExHdl.Regs.RTL.build(map(vectors, pairs), unmapped: :slverr)
 
-  @doc "C header text of `map/1`."
-  def c_header(vectors \\ 2), do: ExHdl.Regs.CHeader.render(map(vectors))
+  @doc "C header text of `map/2`."
+  def c_header(vectors \\ 2, pairs \\ 1), do: ExHdl.Regs.CHeader.render(map(vectors, pairs))
 
-  @doc "Markdown table of `map/1`."
-  def markdown(vectors \\ 2), do: ExHdl.Regs.Markdown.render(map(vectors))
+  @doc "Markdown table of `map/2`."
+  def markdown(vectors \\ 2, pairs \\ 1), do: ExHdl.Regs.Markdown.render(map(vectors, pairs))
 end
