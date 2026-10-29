@@ -42,7 +42,7 @@ defmodule ExPcie.RTL.Dma do
 
   | Use | Bits |
   |---|---|
-  | H2C data read | slot [2:0], generation [`3 - k` + 2:3], pair [5:`6 - k`], epoch [6], 0 [7] |
+  | H2C data read | slot [2:0], generation [`5 - k`:3], pair [5:`6 - k`], epoch [6], 0 [7] |
   | descriptor fetch | channel [2:0] (`2 * pair` H2C, `2 * pair + 1` C2H), generation [6:3], 1 [7] |
 
   with `k = clog2(pairs)`: the pair field takes bits from the H2C
